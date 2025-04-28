@@ -1,121 +1,84 @@
+// Crawler.h
 #ifndef CRAWLER_H
 #define CRAWLER_H
-#define WIN32_LEAN_AND_MEAN
 
-#include <iostream>
-#include <string>
-#include <queue>
-#include <unordered_set>
+#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+#include <queue>
+#include <string>
+#include <unordered_set>
+
+/**
+ * @brief Multi-threaded breadth-first web crawler (WinSock + raw HTTP/1.1).
+ *        One Crawler instance coordinates a shared URL queue, maintains
+ *        de-duplication sets for hosts & IPs, gathers run-time statistics,
+ *        and spawns:
+ *            • N worker threads  -> Crawler::CrawlerThread
+ *            • 1 stats thread    -> Crawler::StatsThread
+ */
 class Crawler {
-    public:
-        Crawler(int numThreads);
+public:
+    explicit Crawler(int numThreads);
+    ~Crawler();
 
-        ~Crawler();
-        
-        // read URLs from file and populate queue
-        void ReadFile(const std::string& filename);
+    /* I/O ------------------------------------------------------------------ */
+    void ReadFile(const std::string& inputPath);
 
-        // crawling thread function
-        void Run();
+    /* Worker & stats entry points (passed to CreateThread) ----------------- */
+    static DWORD WINAPI CrawlerThread(LPVOID);
+    static DWORD WINAPI StatsThread(LPVOID);
 
-        // signal all threads to shutdown
-        void signalShutdown();
+    /* Graceful shutdown ---------------------------------------------------- */
+    void signalShutdown();
 
-        // help keep track of active threads
-        void decrementActiveThreads();
-        int getActiveThreads();
+    /* Public getters (atomic via Interlocked) ------------------------------ */
+    LONG  getQueueSize();
+    LONG  getExtractedURLs();
+    LONG  getUniqueHosts();
+    LONG  getDNSLookups();
+    LONG  getUniqueIPs();
+    LONG  getRobotsChecked();
+    LONG  getPagesCrawled();
+    LONG  getTotalLinks();
+    LONG  getTotalBytes();
+    LONG  getHttp2xx();
+    LONG  getHttp3xx();
+    LONG  getHttp4xx();
+    LONG  getHttp5xx();
+    LONG  getHttpOther();
+    LARGE_INTEGER getStartTime();
+    LARGE_INTEGER getFrequency();
+    int   getActiveThreads();
 
-        // print statistics per two seconds
-        void printStats();
-        void StatsRun();
+private:
+    /* Internal helpers ----------------------------------------------------- */
+    void   Run();          // executed by each crawler thread
+    void   StatsRun();     // executed by stats thread
+    void   printStats();   // 2-second periodic console line
+    bool   checkAndInsertIP(const std::string& ip);
+    bool   checkAndInsertHost(const std::string& host);
 
-        // get start time
-        LARGE_INTEGER getStartTime();
-        // check and insert into seenIPs and seenHosts queues (thread safe)
-        bool checkAndInsertIP(const std::string& ipAddr);
-        bool checkAndInsertHost(const std::string& host);
+    /* Counters updated with Interlocked* ----------------------------------- */
+    LONG extractedURLs{}, uniqueHosts{}, dnsLookups{}, uniqueIPs{},
+        robotsChecked{}, pagesCrawled{}, totalLinks{}, totalBytes{},
+        http2xx{}, http3xx{}, http4xx{}, http5xx{}, httpOther{};
 
-        // thread workers
-        static DWORD WINAPI CrawlerThread(LPVOID param);
-        static DWORD WINAPI StatsThread(LPVOID param);
+    /* Shared structures ---------------------------------------------------- */
+    std::queue<std::string>        urlQueue;
+    std::unordered_set<std::string> seenHosts, seenIPs;
 
-        // update stats
-        void incrementExtractedURLs();
-        void incrementUniqueHosts();
-        void incrementDNSLookups();
-        void incrementUniqueIPs();
-        void incrementRobotsChecked();
-        void incrementRobotsPassed();
-        void incrementPagesCrawled();
-        void incrementHttpStatus(int statusCode);
-        void addTotalLinks(LONG links);
-        void addTotalBytes(LONG bytes);
+    /* Synchronisation ------------------------------------------------------ */
+    CRITICAL_SECTION queueCS, hostCS, ipCS;
+    volatile LONG     activeThreads{};
+    HANDLE            eventQuit{};
 
-        // get stats
-        LONG getExtractedURLs();
-        LONG getUniqueHosts();
-        LONG getDNSLookups();
-        LONG getUniqueIPs();
-        LONG getRobotsChecked();
-        LONG getRobotsPassed();
-        LONG getPagesCrawled();
-        LONG getTotalLinks();
-        LONG getTotalBytes();
-        LONG getQueueSize();
-        LONG getHttp2xx();
-        LONG getHttp3xx();
-        LONG getHttp4xx();
-        LONG getHttp5xx();
-        LONG getHttpOther();
-        LARGE_INTEGER getFrequency();
+    /* Timing --------------------------------------------------------------- */
+    LARGE_INTEGER startTime{}, frequency{};
 
-        LONG getTamuLinkPages();
-        LONG getTamuLinkPagesExternal();
-
-        // synchronization
-        CRITICAL_SECTION queueCriticalSection;
-        // HANDLE queueSemaphore;
-        CRITICAL_SECTION hostCriticalSection;
-        CRITICAL_SECTION ipCriticalSection;
-
-    private:
-        // shared
-        std::queue<std::string> urlQueue;
-        std::unordered_set<std::string> seenHosts;
-        std::unordered_set<std::string> seenIPs;
-
-        // stats
-        LONG extractedURLs;
-        LONG uniqueHosts;
-        LONG dnsLookups;
-        LONG uniqueIPs;
-        LONG robotsChecked;
-        LONG robotsPassed;
-        LONG pagesCrawled;
-        LONG totalLinks;
-        LONG totalBytes;
-
-        LONG tamuLinkPages;
-        LONG tamuLinkPagesExternal;
-
-        // HTTP status codes counts
-        LONG http2xx;
-        LONG http3xx;
-        LONG http4xx;
-        LONG http5xx;
-        LONG httpOther;
-
-        LARGE_INTEGER startTime;
-        LARGE_INTEGER frequency;
-
-        // handle to signal shutdown
-        HANDLE eventQuit;
-
-        // control
-        bool shutdown;
-
-        LONG activeThreads;
+    /* Deleted ops ---------------------------------------------------------- */
+    Crawler(const Crawler&) = delete;
+    Crawler& operator=(const Crawler&) = delete;
 };
+
 #endif // CRAWLER_H
