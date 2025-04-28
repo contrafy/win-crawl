@@ -25,10 +25,24 @@ The project is organized into several key components:
 - **HTMLParserBase:**  
   A pre-compiled library (provided as a .lib file) that parses HTML content to extract URLs from web pages.
 
-## Building with Visual Studio 2019
-
 ### Prerequisites
 
 - Windows operating system
 - Visual Studio 2019 (or later)
 - Windows SDK
+
+### Usage 
+
+`crawler.exe <threads> <seed_file.txt>`
+
+- threads – number of concurrent workers (CPU cores ×2 is a good start)
+- seed_file.txt – one absolute/relative URL per line
+
+**OR** more conveniently `.\run_script.ps1' for a quick demo
+
+---
+
+Happy crawling!
+
+
+
