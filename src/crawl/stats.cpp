@@ -15,7 +15,8 @@ constexpr const char* kCounterNames[kCounterCount] = {
     "unique_ips",      "robots_attempted",   "robots_passed",    "pages_attempted", "pages_ok",
     "http_2xx",        "http_3xx",           "http_4xx",         "http_5xx",    "http_other",
     "links",           "bytes_received",     "connect_fail",     "timeouts",    "tls_fail",
-    "tls_cert_fail",   "port_exhaustion",    "redirects_followed", "dns_queries_sent", "dns_retries", "dns_timeouts",
+    "tls_cert_fail",   "port_exhaustion",    "other_fail",       "redirects_followed", "dns_queries_sent",
+    "dns_retries",     "dns_timeouts",
     "inflight",
 };
 
@@ -105,7 +106,8 @@ std::string format_summary(const Snapshot& s, const RunInfo& info) {
     appendf(out, "Connect failures %llu, timeouts %llu, TLS failures %llu (%llu certificate), redirects followed %llu\n",
             u(s[Counter::ConnectFail]), u(s[Counter::Timeouts]), u(s[Counter::TlsFail]), u(s[Counter::TlsCertFail]),
             u(s[Counter::RedirectsFollowed]));
-    appendf(out, "Port exhaustion retries %llu\n", u(s[Counter::PortExhaustion]));
+    appendf(out, "Other fetch failures (reset, bad reply, too large) %llu, port exhaustion retries %llu\n",
+            u(s[Counter::OtherFail]), u(s[Counter::PortExhaustion]));
     appendf(out, "Peak in-flight %llu\n", u(info.peak_inflight));
     return out;
 }

@@ -311,7 +311,11 @@ void Task::count_failure(FetchError error) {
         w_.stats_.add(Counter::TlsFail);
         w_.stats_.add(Counter::TlsCertFail);
         break;
-    default: break;
+    case FetchError::TooLarge:
+    case FetchError::BadReply:
+    case FetchError::Closed: w_.stats_.add(Counter::OtherFail); break;
+    case FetchError::None:
+    case FetchError::Aborted: break;
     }
 }
 

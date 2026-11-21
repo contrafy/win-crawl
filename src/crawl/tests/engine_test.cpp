@@ -128,6 +128,8 @@ TEST_CASE("engine: classic pipeline counts on a synthetic URL set") {
     CHECK(s[Counter::Links] == 6);
     CHECK(s[Counter::ConnectFail] == 1);
     CHECK(s[Counter::Timeouts] == 1);
+    CHECK(s[Counter::OtherFail] == 1);  // f.test: page over the limit
+    CHECK(s[Counter::PortExhaustion] == 0);
     CHECK(s[Counter::TlsFail] == 0);
     CHECK(s[Counter::RedirectsFollowed] == 0);
     CHECK(s[Counter::BytesReceived] > 0);

@@ -65,6 +65,10 @@ uint64_t host_hash(std::string_view text) {
     return fmix64(mum(state ^ kSecret2, len ^ kSecret0));
 }
 
+// Each shard owns its cache line(s) so loops hammering different shards never
+// bounce a shared line; the padding C4324 reports is the point.
+#pragma warning(push)
+#pragma warning(disable : 4324)
 struct alignas(64) ShardedSet64::Shard {
     SRWLOCK lock = SRWLOCK_INIT;
     bool has_zero = false;  // 0 marks empty slots, so a zero key is tracked aside
@@ -104,6 +108,7 @@ struct alignas(64) ShardedSet64::Shard {
         }
     }
 };
+#pragma warning(pop)
 
 namespace {
 

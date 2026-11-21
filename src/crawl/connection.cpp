@@ -108,6 +108,11 @@ void Connection::close() {
         socket_.close(true);
     }
     tls_.reset();
+    // An idle slot should not pin a multi-megabyte page until its next fetch.
+    if (rx_.capacity() > kShrinkTo) {
+        std::vector<char>().swap(rx_);
+        rx_len_ = 0;
+    }
 }
 
 void Connection::reset_buffers() {
