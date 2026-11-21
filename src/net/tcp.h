@@ -17,6 +17,8 @@
 
 #include <cstddef>
 #include <functional>
+#include <memory>
+#include <vector>
 
 namespace wc::net {
 
@@ -48,13 +50,14 @@ public:
     DWORD open();
 
     // Takes ownership of an accepted socket (already SO_UPDATE_ACCEPT_CONTEXT'd
-    // by TcpListener) and associates it with this socket's loop.
+    // by TcpListener) and associates it with this socket's loop. Ownership is
+    // unconditional: on failure the socket is closed here. Requires !busy().
     DWORD adopt(SOCKET accepted);
 
     void connect(const sockaddr_in& remote);  // ConnectEx -> on_connect
     // Completes once all `len` bytes are written; `data` must stay valid until on_send.
     void send(const char* data, size_t len);
-    // One WSARecv of up to `cap` bytes into `buf` -> on_recv.
+    // One WSARecv of up to `cap` (> 0) bytes into `buf` -> on_recv.
     void recv(char* buf, size_t cap);
 
     // abort = true: SO_LINGER {1, 0} so the close sends RST and leaves no
@@ -64,6 +67,37 @@ public:
     bool is_open() const;
     bool busy() const;  // any operation outstanding
     Loop& loop() const;
+    // For socket options the wrapper does not cover; INVALID_SOCKET when closed.
+    SOCKET native_handle() const;
+
+private:
+    struct Op {
+        IoRequest io;
+        TcpSocket* owner = nullptr;
+        DWORD deferred_error = 0;  // synchronous failure reported via the port
+        bool pending = false;
+    };
+    static void on_connect_done(IoRequest* req, DWORD bytes, DWORD error);
+    static void on_send_done(IoRequest* req, DWORD bytes, DWORD error);
+    static void on_recv_done(IoRequest* req, DWORD bytes, DWORD error);
+    static Op& op_of(IoRequest* req);
+    void init_op(Op& op, void (*complete)(IoRequest*, DWORD, DWORD));
+    void start(Op& op);
+    void defer(Op& op, DWORD error);
+    DWORD settle(Op& op, DWORD loop_error);
+    bool send_chunk();
+
+    Loop& loop_;
+    TcpHandler& handler_;
+    SOCKET sock_ = INVALID_SOCKET;
+    bool closed_ = false;  // close() ran: in-flight operations report aborted
+    Op connect_op_;
+    Op send_op_;
+    Op recv_op_;
+    DWORD recv_flags_ = 0;
+    const char* send_data_ = nullptr;
+    size_t send_len_ = 0;
+    size_t send_done_ = 0;
 };
 
 class TcpListener {
@@ -81,6 +115,20 @@ public:
     DWORD listen(const sockaddr_in& local, int backlog = SOMAXCONN, size_t accept_depth = 64);
     void close();
     bool busy() const;
+    // Bound address after a successful listen() (resolves port 0).
+    sockaddr_in local_address() const;
+
+private:
+    struct AcceptOp;
+    static void on_accept_done(IoRequest* req, DWORD bytes, DWORD error);
+    DWORD arm(AcceptOp& op);
+
+    Loop& loop_;
+    std::function<void(SOCKET)> on_accept_;
+    SOCKET sock_ = INVALID_SOCKET;
+    sockaddr_in local_{};
+    size_t pending_ = 0;
+    std::vector<std::unique_ptr<AcceptOp>> ops_;
 };
 
 }  // namespace wc::net
