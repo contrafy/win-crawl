@@ -45,7 +45,14 @@ TEST_CASE("config: defaults") {
     CHECK_FALSE(cfg.insecure);
     CHECK(cfg.max_redirects == 5);
     CHECK(cfg.stats_interval_ms == 2000);
-    CHECK(cfg.dns_servers.empty());
+    REQUIRE(cfg.dns_servers.size() == 2);
+    CHECK(cfg.dns_servers[0].ipv4_be == 0x01010101u);  // 1.1.1.1
+    CHECK(cfg.dns_servers[0].port == 53);
+    CHECK(cfg.dns_servers[1].ipv4_be == 0x01000001u);  // 1.0.0.1
+    CHECK_FALSE(cfg.dns_system);
+    CHECK(cfg.dns_inflight == 2048);
+    CHECK(cfg.dns_timeout_ms == 1500);
+    CHECK(cfg.dns_attempts == 3);
     CHECK(cfg.json_path.empty());
     CHECK_FALSE(cfg.quiet);
 
@@ -56,9 +63,35 @@ TEST_CASE("config: defaults") {
     CHECK(std::string(mode_name(real.mode)) == "real");
 }
 
+TEST_CASE("config: --dns system") {
+    Config cfg;
+    ParseResult r = parse({"--dns", "system", "urls.txt"}, cfg);
+    REQUIRE(r.status == ParseStatus::Ok);
+    CHECK(cfg.dns_system);
+    CHECK(cfg.dns_servers.empty());
+    CHECK(cfg.dns_inflight == kSystemDnsInflight);
+    REQUIRE(r.notes.size() == 1);
+    CHECK(r.notes[0].find("64") != std::string::npos);
+
+    // An explicit --dns-inflight wins, in either order.
+    Config explicit_cfg;
+    r = parse({"--dns-inflight", "300", "--dns=system", "urls.txt"}, explicit_cfg);
+    REQUIRE(r.status == ParseStatus::Ok);
+    CHECK(explicit_cfg.dns_inflight == 300);
+    CHECK(r.notes.empty());
+
+    // A later explicit list replaces "system".
+    Config later;
+    r = parse({"--dns", "system", "--dns", "9.9.9.9", "urls.txt"}, later);
+    REQUIRE(r.status == ParseStatus::Ok);
+    CHECK_FALSE(later.dns_system);
+    REQUIRE(later.dns_servers.size() == 1);
+    CHECK(later.dns_inflight == 2048);
+}
+
 TEST_CASE("config: every option, both spellings") {
     Config cfg;
-    const ParseResult r = parse({"--mode=real", "-t", "4", "--concurrency=800", "--dns", "127.0.0.1:5353,8.8.8.8",
+    const ParseResult r = parse({"--mode=real", "-t", "4", "--concurrency=800", "--dns", "127.0.0.1:5300,8.8.8.8",
                                  "--dns-inflight", "64", "--dns-timeout", "750", "--dns-attempts=2",
                                  "--connect-timeout", "3000", "--timeout", "8000", "--robots-limit", "32K",
                                  "--page-limit=1M", "--no-keepalive", "--insecure", "--max-redirects", "3",
@@ -70,7 +103,7 @@ TEST_CASE("config: every option, both spellings") {
     CHECK(cfg.concurrency == 800);
     REQUIRE(cfg.dns_servers.size() == 2);
     CHECK(cfg.dns_servers[0].ipv4_be == 0x0100007fu);
-    CHECK(cfg.dns_servers[0].port == 5353);
+    CHECK(cfg.dns_servers[0].port == 5300);
     CHECK(cfg.dns_servers[1].ipv4_be == 0x08080808u);
     CHECK(cfg.dns_servers[1].port == 53);
     CHECK(cfg.dns_inflight == 64);
@@ -129,8 +162,9 @@ TEST_CASE("config: errors") {
     CHECK(fails({"--dns", "1.2.3", "a.txt"}, "--dns"));
     CHECK(fails({"--dns", "1.2.3.256", "a.txt"}, "--dns"));
     CHECK(fails({"--dns", "1.2.3.4:0", "a.txt"}, "--dns"));
-    CHECK(fails({"--dns", "1.2.3.4:5353,", "a.txt"}, "--dns"));
+    CHECK(fails({"--dns", "1.2.3.4:5300,", "a.txt"}, "--dns"));
     CHECK(fails({"--dns", "example.com", "a.txt"}, "--dns"));
+    CHECK(fails({"--dns", "system,1.2.3.4", "a.txt"}, "--dns"));
     CHECK(fails({"--dns-attempts", "11", "a.txt"}, "--dns-attempts"));
     CHECK(fails({"--page-limit", "2T", "a.txt"}, "--page-limit"));
     CHECK(fails({"--page-limit", "2G", "a.txt"}, "--page-limit"));

@@ -24,9 +24,12 @@ struct Config {
     unsigned threads = 0;        // event loops; 0 until parse_args fills in logical CPUs
     unsigned concurrency = 4000; // max in-flight URL tasks, all loops together
 
-    std::vector<DnsServer> dns_servers;  // empty: system DNS servers
-    unsigned dns_inflight = 512;         // max outstanding DNS queries, all loops together
-    unsigned dns_timeout_ms = 2000;      // per attempt
+    // Public resolvers by default: the OS-configured server is often a home
+    // router that collapses under crawl-rate query load.
+    std::vector<DnsServer> dns_servers = {DnsServer{0x01010101u, 53}, DnsServer{0x01000001u, 53}};
+    bool dns_system = false;              // --dns system: the OS-configured servers instead
+    unsigned dns_inflight = 2048;         // max outstanding DNS queries, all loops together
+    unsigned dns_timeout_ms = 1500;       // per attempt
     unsigned dns_attempts = 3;
 
     unsigned connect_timeout_ms = 5000;
@@ -50,8 +53,12 @@ enum class ParseStatus { Ok, Help, Error };
 
 struct ParseResult {
     ParseStatus status = ParseStatus::Ok;
-    std::string message;  // the problem when status == Error
+    std::string message;              // the problem when status == Error
+    std::vector<std::string> notes;   // adjustments worth telling the user on Ok
 };
+
+// Total DNS in-flight cap applied with --dns system unless --dns-inflight is given.
+constexpr unsigned kSystemDnsInflight = 64;
 
 // Parses argv[1..argc). On Ok every field of `out` is final (defaults resolved:
 // threads = logical CPUs, robots_limit per mode). Help: -h/--help was given.

@@ -15,7 +15,8 @@ constexpr const char* kCounterNames[kCounterCount] = {
     "unique_ips",      "robots_attempted",   "robots_passed",    "pages_attempted", "pages_ok",
     "http_2xx",        "http_3xx",           "http_4xx",         "http_5xx",    "http_other",
     "links",           "bytes_received",     "connect_fail",     "timeouts",    "tls_fail",
-    "redirects_followed", "dns_queries_sent", "dns_retries",     "dns_timeouts", "inflight",
+    "tls_cert_fail",   "port_exhaustion",    "redirects_followed", "dns_queries_sent", "dns_retries", "dns_timeouts",
+    "inflight",
 };
 
 void appendf(std::string& out, const char* fmt, ...) {
@@ -96,14 +97,15 @@ std::string format_summary(const Snapshot& s, const RunInfo& info) {
     const double dns_pct = dns_done > 0 ? 100.0 * static_cast<double>(s[Counter::DnsOk]) / static_cast<double>(dns_done) : 0.0;
     appendf(out, "\n");
     appendf(out, "Mode %s, %u threads, concurrency %u, %.1f s\n", info.mode.c_str(), info.threads, info.concurrency, t);
-    appendf(out, "DNS: %llu ok, %llu failed (%.1f%% success), %llu queries sent, %llu retries, %llu timeouts\n",
+    appendf(out, "DNS: %llu ok, %llu failed (%.1f%% success), %llu queries sent, %llu retries, %llu timed out\n",
             u(s[Counter::DnsOk]), u(s[Counter::DnsFail]), dns_pct, u(s[Counter::DnsQueriesSent]),
             u(s[Counter::DnsRetries]), u(s[Counter::DnsTimeouts]));
     appendf(out, "Unique IPs %llu, robots passed %llu, pages attempted %llu\n", u(s[Counter::UniqueIps]),
             u(s[Counter::RobotsPassed]), u(s[Counter::PagesAttempted]));
-    appendf(out, "Connect failures %llu, timeouts %llu, TLS failures %llu, redirects followed %llu\n",
-            u(s[Counter::ConnectFail]), u(s[Counter::Timeouts]), u(s[Counter::TlsFail]),
+    appendf(out, "Connect failures %llu, timeouts %llu, TLS failures %llu (%llu certificate), redirects followed %llu\n",
+            u(s[Counter::ConnectFail]), u(s[Counter::Timeouts]), u(s[Counter::TlsFail]), u(s[Counter::TlsCertFail]),
             u(s[Counter::RedirectsFollowed]));
+    appendf(out, "Port exhaustion retries %llu\n", u(s[Counter::PortExhaustion]));
     appendf(out, "Peak in-flight %llu\n", u(info.peak_inflight));
     return out;
 }

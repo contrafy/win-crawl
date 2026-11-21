@@ -168,11 +168,17 @@ bool parse_dns_list(std::string_view text, std::vector<DnsServer>& out) {
 }
 
 ParseResult error(std::string message) {
-    return ParseResult{ParseStatus::Error, std::move(message)};
+    return ParseResult{ParseStatus::Error, std::move(message), {}};
 }
 
+// Options whose defaults depend on whether they were given explicitly.
+struct Given {
+    bool robots_limit = false;
+    bool dns_inflight = false;
+};
+
 // Applies one option. `value` is empty for flags.
-ParseResult apply(const OptSpec& spec, std::string_view value, Config& cfg, bool& robots_given) {
+ParseResult apply(const OptSpec& spec, std::string_view value, Config& cfg, Given& given) {
     uint64_t v = 0;
     auto bad = [&](const char* expected) {
         return error("invalid value '" + std::string(value) + "' for " + display(spec) + ": expected " + expected);
@@ -196,11 +202,18 @@ ParseResult apply(const OptSpec& spec, std::string_view value, Config& cfg, bool
         cfg.concurrency = static_cast<unsigned>(v);
         break;
     case Opt::Dns:
-        if (!parse_dns_list(value, cfg.dns_servers)) return bad("IPv4[:port][,IPv4[:port]...]");
+        if (value == "system") {
+            cfg.dns_system = true;
+            cfg.dns_servers.clear();
+            break;
+        }
+        if (!parse_dns_list(value, cfg.dns_servers)) return bad("system or IPv4[:port][,IPv4[:port]...]");
+        cfg.dns_system = false;
         break;
     case Opt::DnsInflight:
         if (!parse_range(value, 1, 65535, v)) return bad("an integer in 1..65535");
         cfg.dns_inflight = static_cast<unsigned>(v);
+        given.dns_inflight = true;
         break;
     case Opt::DnsTimeout:
         if (!parse_range(value, 1, 60000, v)) return bad("milliseconds in 1..60000");
@@ -221,7 +234,7 @@ ParseResult apply(const OptSpec& spec, std::string_view value, Config& cfg, bool
     case Opt::RobotsLimit:
         if (!parse_bytes(value, 1, kGiB, v)) return bad("bytes in 1..1G (K/M/G suffixes allowed)");
         cfg.robots_limit = v;
-        robots_given = true;
+        given.robots_limit = true;
         break;
     case Opt::PageLimit:
         if (!parse_bytes(value, 1, kGiB, v)) return bad("bytes in 1..1G (K/M/G suffixes allowed)");
@@ -267,7 +280,7 @@ unsigned logical_cpu_count() {
 
 ParseResult parse_args(int argc, const char* const* argv, Config& out) {
     Config cfg;
-    bool robots_given = false;
+    Given given;
     bool options_done = false;
     std::vector<std::string_view> positional;
 
@@ -320,7 +333,7 @@ ParseResult parse_args(int argc, const char* const* argv, Config& out) {
             return error("option " + display(*spec) + " takes no value");
         }
 
-        ParseResult r = apply(*spec, value, cfg, robots_given);
+        ParseResult r = apply(*spec, value, cfg, given);
         if (r.status != ParseStatus::Ok) {
             return r;
         }
@@ -341,11 +354,19 @@ ParseResult parse_args(int argc, const char* const* argv, Config& out) {
     if (cfg.threads > cfg.concurrency) {
         cfg.threads = cfg.concurrency;
     }
-    if (!robots_given) {
+    if (!given.robots_limit) {
         cfg.robots_limit = cfg.mode == Mode::Real ? kRealRobotsLimit : kClassicRobotsLimit;
     }
+    ParseResult result;
+    if (cfg.dns_system && !given.dns_inflight && cfg.dns_inflight > kSystemDnsInflight) {
+        // OS-configured resolvers (typically a home router) drop most queries
+        // beyond a few dozen in flight.
+        cfg.dns_inflight = kSystemDnsInflight;
+        result.notes.push_back("note: --dns system caps DNS in-flight queries at " +
+                               std::to_string(kSystemDnsInflight) + " (raise with --dns-inflight)");
+    }
     out = std::move(cfg);
-    return {};
+    return result;
 }
 
 std::string usage_text() {
@@ -365,9 +386,11 @@ Engine:
   -c, --concurrency N     max in-flight URL tasks across all loops (default 4000)
 
 DNS:
-  --dns ADDR[:PORT][,...] DNS servers (default: the system's servers)
-  --dns-inflight N        max outstanding DNS queries in total (default 512)
-  --dns-timeout MS        per-attempt timeout (default 2000)
+  --dns ADDR[:PORT][,...] DNS servers (default 1.1.1.1,1.0.0.1); use --dns system
+                          for the OS-configured servers (in-flight then capped
+                          at 64 unless --dns-inflight is given)
+  --dns-inflight N        max outstanding DNS queries in total (default 2048)
+  --dns-timeout MS        per-attempt timeout (default 1500)
   --dns-attempts N        attempts per name (default 3)
 
 HTTP:
@@ -386,7 +409,9 @@ Output:
   -q, --quiet             no periodic status lines
   -h, --help              this text
 
-Exit codes: 0 run completed, 1 fatal error (e.g. unreadable input), 2 usage error.
+Ctrl+C stops taking URLs, aborts what is in flight and prints the summary.
+Exit codes: 0 run completed, 1 fatal error (e.g. unreadable input), 2 usage error,
+130 interrupted by Ctrl+C.
 )";
 }
 

@@ -83,7 +83,8 @@ TEST_CASE("stats: json carries every schema key in order") {
          {"mode", "threads", "concurrency", "elapsed_s", "urls_read", "urls_parsed", "unique_hosts", "dns_ok",
           "dns_fail", "unique_ips", "robots_attempted", "robots_passed", "pages_attempted", "pages_ok", "http_2xx",
           "http_3xx", "http_4xx", "http_5xx", "http_other", "links", "bytes_received", "connect_fail", "timeouts",
-          "tls_fail", "redirects_followed", "dns_queries_sent", "dns_retries", "dns_timeouts", "peak_inflight"}) {
+          "tls_fail", "tls_cert_fail", "port_exhaustion", "redirects_followed", "dns_queries_sent", "dns_retries",
+          "dns_timeouts", "peak_inflight"}) {
         const size_t at = json.find("\"" + std::string(key) + "\":");
         CHECK_MESSAGE(at != std::string::npos, key);
         CHECK_MESSAGE(at >= prev, key);

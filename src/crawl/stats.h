@@ -40,7 +40,9 @@ enum class Counter : uint32_t {
     BytesReceived,     // every byte read from sockets (headers included)
     ConnectFail,
     Timeouts,
-    TlsFail,
+    TlsFail,           // every TLS failure, certificate rejections included
+    TlsCertFail,       // certificate rejected by Verify::Chain (extra JSON key)
+    PortExhaustion,    // connects deferred for lack of ephemeral ports (extra JSON key)
     RedirectsFollowed,
     DnsQueriesSent,    // mirrored from the loop's resolver counters
     DnsRetries,
