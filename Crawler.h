@@ -51,7 +51,7 @@ class Crawler {
         void incrementPagesCrawled();
         void incrementHttpStatus(int statusCode);
         void addTotalLinks(LONG links);
-        void addTotalBytes(LONG bytes);
+        void addTotalBytes(LONG64 bytes);
 
         // get stats
         LONG getExtractedURLs();
@@ -62,7 +62,7 @@ class Crawler {
         LONG getRobotsPassed();
         LONG getPagesCrawled();
         LONG getTotalLinks();
-        LONG getTotalBytes();
+        LONG64 getTotalBytes();
         LONG getQueueSize();
         LONG getHttp2xx();
         LONG getHttp3xx();
@@ -70,9 +70,6 @@ class Crawler {
         LONG getHttp5xx();
         LONG getHttpOther();
         LARGE_INTEGER getFrequency();
-
-        LONG getTamuLinkPages();
-        LONG getTamuLinkPagesExternal();
 
         // synchronization
         CRITICAL_SECTION queueCriticalSection;
@@ -95,10 +92,7 @@ class Crawler {
         LONG robotsPassed;
         LONG pagesCrawled;
         LONG totalLinks;
-        LONG totalBytes;
-
-        LONG tamuLinkPages;
-        LONG tamuLinkPagesExternal;
+        LONG64 totalBytes;
 
         // HTTP status codes counts
         LONG http2xx;
@@ -112,9 +106,6 @@ class Crawler {
 
         // handle to signal shutdown
         HANDLE eventQuit;
-
-        // control
-        bool shutdown;
 
         LONG activeThreads;
 };

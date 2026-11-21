@@ -1,3 +1,4 @@
+#include <cctype>
 #define _WINSOCK_DEPRECATED_NO_WARNINGS
 #define WIN32_LEAN_AND_MEAN
 
@@ -189,17 +190,31 @@ bool Socket::connect(const std::string& host, int port) {
 	setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
 	setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
 
-	
 	// set all the params to connect to server object
-	sockaddr_in server;
+	sockaddr_in server = {};
 	server.sin_family = AF_INET;
-	server.sin_port = htons(port);
+	server.sin_port = htons(static_cast<u_short>(port));
 	server.sin_addr = sin_addr;
 
+	// SO_SNDTIMEO does not apply to connect(); connect non-blocking and bound the wait with select()
+	u_long nonBlocking = 1;
+	ioctlsocket(sock, FIONBIO, &nonBlocking);
 	if (::connect(sock, (struct sockaddr*)&server, sizeof(server)) == SOCKET_ERROR) {
-		// std::cout << "failed with " << WSAGetLastError() << std::endl;
-		return false;
+		if (WSAGetLastError() != WSAEWOULDBLOCK) {
+			return false;
+		}
+		fd_set writefds, exceptfds;
+		FD_ZERO(&writefds);
+		FD_ZERO(&exceptfds);
+		FD_SET(sock, &writefds);
+		FD_SET(sock, &exceptfds);
+		timeval connectTimeout = { 10, 0 };
+		if (select(0, nullptr, &writefds, &exceptfds, &connectTimeout) <= 0 || FD_ISSET(sock, &exceptfds)) {
+			return false;
+		}
 	}
+	u_long blocking = 0;
+	ioctlsocket(sock, FIONBIO, &blocking);
 	return true;
 }
 
@@ -212,7 +227,7 @@ bool Socket::sendHTTPRequest(const std::string& host, const std::string& request
 
 	// printf("\n%s\n", httpRequest.c_str());
 
-	if(send(sock, httpRequest.c_str(), httpRequest.length(), 0) == SOCKET_ERROR) {
+	if(send(sock, httpRequest.c_str(), static_cast<int>(httpRequest.length()), 0) == SOCKET_ERROR) {
 		// std::cout << "failed with " << WSAGetLastError() << std::endl;
 		return false;
 	}
@@ -221,27 +236,28 @@ bool Socket::sendHTTPRequest(const std::string& host, const std::string& request
 }
 
 bool Socket::receiveResponse(std::string& response, int& statusCode, const size_t& limit) {
-	// reset buffer and position pointer before reading in new response
+	// a previous large page may have grown the buffer; give the memory back
+	if (allocatedSize > 32 * 1024) {
+		delete[] buf;
+		buf = new char[INITIAL_BUF_SIZE];
+		allocatedSize = INITIAL_BUF_SIZE;
+	}
 	curPos = 0;
-	memset(buf, 0, allocatedSize);
 
 	if (!Read(limit)) {
-		// error output is handled in all False branches of Read()
 		return false;
 	}
 
-	response = std::string(buf, curPos);
-	statusCode = 0;
-
-	// extract status code from response
-	size_t pos = response.find(" ");
-	if (pos != std::string::npos) {
-		size_t endPos = response.find(" ", pos + 1);
-		if (endPos != std::string::npos) {
-			statusCode = std::stoi(response.substr(pos + 1, endPos - pos - 1));
-		}
+	// status line must look like "HTTP/x.y NNN"
+	if (curPos < 12 || strncmp(buf, "HTTP/", 5) != 0) {
+		return false;
 	}
+	const char* code = strchr(buf, ' ');
+	if (code == nullptr || code - buf > 8 || !isdigit((unsigned char)code[1]) || !isdigit((unsigned char)code[2]) || !isdigit((unsigned char)code[3])) {
+		return false;
+	}
+	statusCode = (code[1] - '0') * 100 + (code[2] - '0') * 10 + (code[3] - '0');
 
-	//printf("\n\n%s\n\nStatus Code Var: %i\n\n", response.c_str(), statusCode);
+	response.assign(buf, curPos);
 	return true;
 }

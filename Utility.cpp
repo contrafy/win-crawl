@@ -1,50 +1,65 @@
 #include "Utility.h"
 
-#include <regex>
-#include <iostream>
+#include <cctype>
 
+// Parses http://host[:port][/path][?query][#fragment]. The fragment is dropped,
+// the host is lowercased, and an absent path becomes "/".
 bool parseURL(const std::string& url, std::string& scheme, std::string& host, int& port, std::string& request) {
-    // port and path are marked as optional so the regex_match() is only checking for http://baseurl basically
-    std::regex urlRegex(R"(^([a-zA-Z][a-zA-Z0-9+.-]*)://([^/:]+)(?::(\d+))?(?:(/.*)?)?)");
-    std::smatch matches;
-
-    if (std::regex_match(url, matches, urlRegex)) {
-        if ((scheme = matches[1].str()) != "http") {
-            // printf("failed with invalid scheme\n");
+    const std::string prefix = "http://";
+    if (url.size() <= prefix.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < prefix.size(); i++) {
+        if (std::tolower(static_cast<unsigned char>(url[i])) != prefix[i]) {
             return false;
         }
-        host = matches[2].str();
+    }
+    scheme = "http";
 
-        // extract the port if one exists
-        // default to 80 otherwise
-        if (matches[3].matched) {
-            std::string portStr = matches[3].str();
-
-            try {
-                // will go to catch block if there are no numbers
-                port = std::stoi(portStr);
-
-                // check if port is invalid (0 or not in valid range)
-                if (port <= 0 || port > 65535) {
-                    // printf("failed with invalid port\n");
-                    return false;
-                }
-            }
-            catch (const std::invalid_argument& e) {
-                // printf("failed with invalid port\n");
-                return false;
-            }
-        }
-        else {
-            port = 80;
-        }
-
-        //path default to /
-        request = matches[4].length() > 0 ? matches[4].str() : "/";
-        return true;
+    size_t end = url.find('#', prefix.size());
+    if (end == std::string::npos) {
+        end = url.size();
     }
 
-    //uh oh
-    // printf("failed with invalid URL\n");
-    return false;
+    size_t hostEnd = url.find_first_of(":/?", prefix.size());
+    if (hostEnd == std::string::npos || hostEnd > end) {
+        hostEnd = end;
+    }
+    if (hostEnd == prefix.size()) {
+        return false;
+    }
+    host.assign(url, prefix.size(), hostEnd - prefix.size());
+    for (char& c : host) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+
+    size_t pos = hostEnd;
+    port = 80;
+    if (pos < end && url[pos] == ':') {
+        size_t portEnd = url.find_first_of("/?", pos + 1);
+        if (portEnd == std::string::npos || portEnd > end) {
+            portEnd = end;
+        }
+        if (portEnd == pos + 1 || portEnd - pos - 1 > 5) {
+            return false;
+        }
+        port = 0;
+        for (size_t i = pos + 1; i < portEnd; i++) {
+            if (!std::isdigit(static_cast<unsigned char>(url[i]))) {
+                return false;
+            }
+            port = port * 10 + (url[i] - '0');
+        }
+        if (port <= 0 || port > 65535) {
+            return false;
+        }
+        pos = portEnd;
+    }
+
+    request.clear();
+    if (pos == end || url[pos] != '/') {
+        request = "/";
+    }
+    request.append(url, pos, end - pos);
+    return true;
 }

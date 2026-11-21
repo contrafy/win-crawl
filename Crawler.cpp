@@ -4,7 +4,6 @@
 #include "Utility.h"
 
 #include <cstdio>
-#include <regex>
 #include <fstream>
 #include <algorithm>
 
@@ -36,11 +35,8 @@ Crawler::Crawler(int numThreads) {
     http5xx = 0;
     httpOther = 0;
 
-    tamuLinkPages = 0;
-    tamuLinkPagesExternal = 0;
 
     activeThreads = numThreads;
-    shutdown = false;
 
     // timer starts in Crawler::StatsThread
 }
@@ -91,9 +87,6 @@ void Crawler::Run() {
     size_t limit;
 
     char ipBuffer[INET_ADDRSTRLEN]; // buffer to hold IP address string
-    const std::regex tamuRegex(R"(^https?://([a-zA-Z0-9-]+\.)*tamu\.edu(/|$))");
-    const std::regex internalTAMURegex(R"(^([a-zA-Z0-9-]+\.)*tamu\.edu$)");
-    bool containsTAMULink = false;
 
     while (true) {
         // check if queue is empty and safely pop a value
@@ -178,57 +171,26 @@ void Crawler::Run() {
         if (!socket.receiveResponse(response, statusCode, limit)) {
             continue;
         }
-        InterlockedAdd(&totalBytes, (static_cast<LONG>(response.length())));
+        InterlockedAdd64(&totalBytes, static_cast<LONG64>(response.length()));
 
         // increment the appropriate HTTP code, parse if valid response
         if (statusCode >= 200 && statusCode < 300) {
             InterlockedIncrement(&http2xx);
 
-            // parse page and extract links
+            // parse page and extract links; the parser takes a mutable buffer
             size_t headerEnd = response.find("\r\n\r\n");
             int nLinks = 0;
 
             if (headerEnd != std::string::npos) {
-                std::string htmlBody = response.substr(headerEnd + 4);
+                char* body = response.data() + headerEnd + 4;
+                int bodyLen = static_cast<int>(response.size() - headerEnd - 4);
 
-                // for mem safety
-                std::vector<char> modifiableHtmlBody(htmlBody.begin(), htmlBody.end());
-                modifiableHtmlBody.push_back('\0'); // null terminate
-
-                std::string baseUrlStr = "http://" + host;
-                std::vector<char> baseUrl(baseUrlStr.begin(), baseUrlStr.end());
-                baseUrl.push_back('\0'); // null terminate
-
-                char* linkBuffer = parser->Parse((char*)htmlBody.c_str(), (int)htmlBody.length(), (char*)baseUrlStr.c_str(), (int)(baseUrl.size()), &nLinks);
+                std::string baseUrl = "http://" + host;
+                parser->Parse(body, bodyLen, baseUrl.data(), static_cast<int>(baseUrl.size()), &nLinks);
                 if (nLinks < 0) {
                     nLinks = 0;
                 }
                 InterlockedAdd(&totalLinks, nLinks);
-
-                /* this is expensive for some reason
-                // scan for tamu links
-                containsTAMULink = false;
-
-                for (int i = 0; i < nLinks; i++) {
-                    std::string extractedLink = std::string(linkBuffer + i);
-
-                    // use regex to match TAMU URLs
-                    if (std::regex_match(extractedLink, tamuRegex)) {
-                        containsTAMULink = true;
-                        break; // all we want to know is how many pages have a link, not how many links
-                    }
-                }
-
-                // increment counters
-                if (containsTAMULink) {
-                    InterlockedIncrement(&tamuLinkPages);
-
-                    // determine if the originating page is external to TAMU
-                    if (!std::regex_match(host, internalTAMURegex)) {
-                        InterlockedIncrement(&tamuLinkPagesExternal);
-                    }
-                }
-                */
             }
         }
         else if (statusCode >= 300 && statusCode < 400) {
@@ -244,7 +206,6 @@ void Crawler::Run() {
             InterlockedIncrement(&httpOther);
         }
 
-        InterlockedAdd(&totalBytes, (static_cast<LONG>(response.length())));
         InterlockedIncrement(&pagesCrawled);
     }
 
@@ -254,7 +215,6 @@ void Crawler::Run() {
 }
 
 void Crawler::signalShutdown() {
-    shutdown = true;
     // signal the event to notify the stats thread
     SetEvent(eventQuit);
 }
@@ -322,8 +282,8 @@ void Crawler::addTotalLinks(LONG links) {
     InterlockedAdd(&totalLinks, links);
 }
 
-void Crawler::addTotalBytes(LONG bytes) {
-    InterlockedAdd(&totalBytes, bytes);
+void Crawler::addTotalBytes(LONG64 bytes) {
+    InterlockedAdd64(&totalBytes, bytes);
 }
 
 // get stats methods
@@ -359,8 +319,8 @@ LONG Crawler::getTotalLinks() {
     return InterlockedCompareExchange(&totalLinks, 0, 0);
 }
 
-LONG Crawler::getTotalBytes() {
-    return InterlockedCompareExchange(&totalBytes, 0, 0);
+LONG64 Crawler::getTotalBytes() {
+    return InterlockedCompareExchange64(&totalBytes, 0, 0);
 }
 
 LONG Crawler::getQueueSize() {
@@ -392,14 +352,6 @@ LONG Crawler::getHttpOther() {
 
 LARGE_INTEGER Crawler::getFrequency() {
     return frequency;
-}
-
-LONG Crawler::getTamuLinkPages() {
-    return InterlockedCompareExchange(&tamuLinkPages, 0, 0);
-}
-
-LONG Crawler::getTamuLinkPagesExternal() {
-    return InterlockedCompareExchange(&tamuLinkPagesExternal, 0, 0);
 }
 
 bool Crawler::checkAndInsertIP(const std::string& ipAddr) {
@@ -435,7 +387,7 @@ void Crawler::StatsRun()
     LARGE_INTEGER lastTime = startTime;
 
     LONG lastCrawled = 0;
-    LONG lastBytes = 0;
+    LONG64 lastBytes = 0;
 
     while (WaitForSingleObject(eventQuit, 2000) == WAIT_TIMEOUT)
     {
@@ -447,7 +399,7 @@ void Crawler::StatsRun()
         double elapsedSeconds = static_cast<double>(currentTime.QuadPart - lastTime.QuadPart) / frequency.QuadPart;
 
         LONG currentCrawled = getPagesCrawled();
-        LONG currentBytes = getTotalBytes();
+        LONG64 currentBytes = getTotalBytes();
 
         double pps = (currentCrawled - lastCrawled) / elapsedSeconds;
         double Mbps = ((currentBytes - lastBytes) * 8.0) / (elapsedSeconds * 1024.0 * 1024.0);
