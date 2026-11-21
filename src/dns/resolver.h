@@ -54,6 +54,7 @@ public:
         uint64_t noanswer = 0;
         uint64_t servfail = 0;
         uint64_t timeouts = 0;   // queries that exhausted all attempts
+        uint64_t truncated = 0;  // TC replies (included in noanswer; no TCP fallback)
         uint64_t cancelled = 0;  // failed by shutdown()
         uint64_t invalid = 0;
         uint64_t literals = 0;    // IPv4 literals answered without a query
