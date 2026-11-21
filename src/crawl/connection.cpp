@@ -213,7 +213,7 @@ void Connection::on_send(net::TcpSocket&, DWORD error) {
         if (stale_keepalive()) {
             retry_fresh();
         } else {
-            fail(FetchError::Closed);
+            fail(handshaking_ ? FetchError::TlsFail : FetchError::Closed);
         }
         return;
     }
@@ -354,8 +354,10 @@ void Connection::on_reply_bytes(bool eof) {
 void Connection::complete() {
     done_ = true;
     cancel_timers();
-    // Reuse only a cleanly framed reply with nothing unexpected behind it.
+    // Reuse only a cleanly framed reply with nothing unexpected behind it, including
+    // TLS output (e.g. a KeyUpdate reply) still waiting to be sent.
     keep_open_ = options_.keep_alive && parser_.keep_alive() && !eof_ && parser_.consumed() == rx_len_ &&
+                 wire_.empty() &&
                  (!is_tls_ || (tls_ && tls_->state() == tls::ClientSession::State::Established &&
                                tls_->pending_input() == 0));
     if (!keep_open_) {

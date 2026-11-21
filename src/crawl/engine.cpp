@@ -205,6 +205,11 @@ void Task::resolve(Phase phase, const std::string& host) {
 }
 
 void Task::on_dns(dns::Status status, uint32_t ipv4_be) {
+    // Resolver::shutdown() fails pending lookups; those are cancellations, not DNS failures.
+    if (w_.stopping_) {
+        finish();
+        return;
+    }
     const bool ok = status == dns::Status::Ok;
     switch (phase_) {
     case Phase::Dns:

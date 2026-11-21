@@ -10,6 +10,7 @@
 #include <windows.h>
 
 #include <atomic>
+#include <mutex>
 #include <cstdio>
 #include <string>
 
@@ -17,7 +18,10 @@ using namespace wc::crawl;
 
 namespace {
 
-std::atomic<Engine*> g_engine{nullptr};
+// The handler runs on a system thread that SetConsoleCtrlHandler(..., FALSE) does
+// not wait for, so main clears g_engine under the same lock before the Engine dies.
+std::mutex g_engine_mutex;
+Engine* g_engine = nullptr;
 std::atomic<int> g_interrupts{0};
 
 // Runs on a system-created thread. The first Ctrl+C drains the crawl and still
@@ -30,8 +34,9 @@ BOOL WINAPI on_console_ctrl(DWORD type) {
     if (g_interrupts.fetch_add(1) > 0) {
         return FALSE;
     }
-    if (Engine* engine = g_engine.load()) {
-        engine->request_stop();
+    std::lock_guard lock(g_engine_mutex);
+    if (g_engine != nullptr) {
+        g_engine->request_stop();
     }
     return TRUE;
 }
@@ -80,7 +85,10 @@ int main(int argc, char** argv) {
 
     Stats stats(cfg.threads);
     Engine engine(cfg, input, stats);
-    g_engine.store(&engine);
+    {
+        std::lock_guard lock(g_engine_mutex);
+        g_engine = &engine;
+    }
     SetConsoleCtrlHandler(on_console_ctrl, TRUE);
 
     Reporter reporter(stats, input.total(), cfg.stats_interval_ms, cfg.quiet ? nullptr : stdout);
@@ -89,7 +97,10 @@ int main(int argc, char** argv) {
     reporter.stop();
 
     SetConsoleCtrlHandler(on_console_ctrl, FALSE);
-    g_engine.store(nullptr);
+    {
+        std::lock_guard lock(g_engine_mutex);
+        g_engine = nullptr;
+    }
     if (!ok) {
         std::fprintf(stderr, "wincrawl: %s\n", error.c_str());
         return 1;
