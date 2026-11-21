@@ -13,9 +13,9 @@
   stopped on exit.
 
 .EXAMPLE
-  bench\run-local.ps1 -Wincrawl build\release\apps\wincrawl\wincrawl.exe -Profile wan
+  bench\run-local.ps1 -Wincrawl build\release\wincrawl.exe -Profile wan
 .EXAMPLE
-  bench\run-local.ps1 -Legacy build\release\wincrawl_legacy.exe -LegacyCount 20000 -LegacyThreads 500,2000
+  bench\run-local.ps1 -Legacy ..\wc-legacy\build\release\wincrawl.exe -LegacyCount 20000 -LegacyThreads 500,2000
 #>
 [CmdletBinding()]
 param(
