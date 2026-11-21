@@ -8,12 +8,10 @@
 // send of a shared, immutable buffer.
 //
 // Connection handling: HTTP/1.1 keep-alive by default, HTTP/1.0 keep-alive only
-// when asked, pipelined requests served in order. After a response to a client
-// that asked for close, the server half-closes (FIN) and waits for the client's
-// FIN or RST before an abortive close, so neither side keeps a TIME_WAIT entry
-// (graceful_close = true instead closes normally and leaves TIME_WAIT on the
-// server). Peers that close or reset, idle connections and shutdown all use
-// abortive close.
+// when asked, pipelined requests served in order. A response to a client that
+// asked for close is followed by a normal close (FIN; close-delimited readers
+// need it). Peers that close or reset, idle connections and shutdown get an
+// abortive close (RST), which leaves no TIME_WAIT on either side.
 
 #include "benchsrv/behavior.h"
 #include "net/loop.h"
@@ -31,8 +29,7 @@ namespace wc::benchsrv {
 
 struct HttpServerConfig {
     uint32_t threads = 4;              // worker loops
-    uint32_t idle_timeout_ms = 30000;  // idle keep-alive / half-closed connections get reset
-    bool graceful_close = false;
+    uint32_t idle_timeout_ms = 30000;  // idle keep-alive connections get reset
     size_t accept_depth = 256;  // outstanding AcceptEx calls
 };
 

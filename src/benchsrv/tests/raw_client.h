@@ -226,6 +226,13 @@ public:
         return false;
     }
 
+    // True only for an orderly FIN (recv == 0), not a reset.
+    bool clean_eof() {
+        if (!buf_.empty()) return false;
+        char c;
+        return recv(s_, &c, 1, 0) == 0;
+    }
+
     size_t buffered() const { return buf_.size(); }
 
 private:

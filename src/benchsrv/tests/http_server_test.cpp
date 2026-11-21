@@ -107,36 +107,32 @@ TEST_CASE("HEAD responses carry headers only") {
 }
 
 TEST_CASE("Connection: close and HTTP/1.0 close after the response") {
-    for (bool graceful : {false, true}) {
-        CAPTURE(graceful);
-        HttpServerConfig cfg;
-        cfg.graceful_close = graceful;
-        Fixture f(cfg);
+    Fixture f;
 
-        RawSocket s = tcp_connect(f.addr);
-        HttpReader reader(s.get());
-        REQUIRE(send_all(s.get(), get("/robots.txt", 3, "Connection: close\r\n")));
-        HttpReply r = reader.read();
-        REQUIRE(r.ok);
-        CHECK(r.header("Connection") == "close");
-        CHECK(reader.at_eof());
+    // Close-delimited readers need a clean FIN after the full body, not a reset.
+    RawSocket s = tcp_connect(f.addr);
+    HttpReader reader(s.get());
+    REQUIRE(send_all(s.get(), get("/p/1", 3, "Connection: close\r\n")));
+    HttpReply r = reader.read();
+    REQUIRE(r.ok);
+    CHECK(r.header("Connection") == "close");
+    CHECK(reader.clean_eof());
 
-        // HTTP/1.0 defaults to close; the legacy crawler reads to EOF.
-        RawSocket s10 = tcp_connect(f.addr);
-        HttpReader r10(s10.get());
-        REQUIRE(send_all(s10.get(), get("/robots.txt", 3, "", "HEAD", "HTTP/1.0")));
-        CHECK(r10.read(true).ok);
-        CHECK(r10.at_eof());
+    // HTTP/1.0 defaults to close; the legacy crawler reads to EOF.
+    RawSocket s10 = tcp_connect(f.addr);
+    HttpReader r10(s10.get());
+    REQUIRE(send_all(s10.get(), get("/robots.txt", 3, "", "HEAD", "HTTP/1.0")));
+    CHECK(r10.read(true).ok);
+    CHECK(r10.clean_eof());
 
-        // HTTP/1.0 with keep-alive stays open.
-        RawSocket ska = tcp_connect(f.addr);
-        HttpReader rka(ska.get());
-        for (int i = 0; i < 2; ++i) {
-            REQUIRE(send_all(ska.get(), get("/robots.txt", 3, "Connection: keep-alive\r\n", "GET", "HTTP/1.0")));
-            HttpReply k = rka.read();
-            REQUIRE(k.ok);
-            CHECK(k.header("Connection") == "keep-alive");
-        }
+    // HTTP/1.0 with keep-alive stays open.
+    RawSocket ska = tcp_connect(f.addr);
+    HttpReader rka(ska.get());
+    for (int i = 0; i < 2; ++i) {
+        REQUIRE(send_all(ska.get(), get("/robots.txt", 3, "Connection: keep-alive\r\n", "GET", "HTTP/1.0")));
+        HttpReply k = rka.read();
+        REQUIRE(k.ok);
+        CHECK(k.header("Connection") == "keep-alive");
     }
 }
 

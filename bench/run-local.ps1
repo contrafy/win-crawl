@@ -25,8 +25,10 @@ param(
     [ValidateSet('lan', 'wan')][string]$Profile = 'lan',
     [int]$Count = 200000,                 # URLs for wincrawl
     [int]$LegacyCount = 0,                # URLs for the legacy crawler (0 = -Count)
-    [int[]]$Concurrency = @(500, 2000, 8000),
-    [int[]]$LegacyThreads = @(500, 2000),
+    # Strings, not [int[]]: under `powershell -File` "500,2000" arrives as one
+    # string and [int] conversion would read it as 5002000 (thousands separator).
+    [string[]]$Concurrency = @('500', '2000', '8000'),
+    [string[]]$LegacyThreads = @('500', '2000'),
     [int]$Threads = 0,                    # wincrawl -t (0 = its default)
     [int]$ServerThreads = 4,              # benchd HTTP worker loops
     [int]$HttpPort = 8080,
@@ -67,6 +69,11 @@ New-Item -ItemType Directory -Force -Path $work | Out-Null
 $report = Join-Path $OutDir "$stamp.md"
 
 function Quote([string]$a) { if ($a -match '[\s"]') { '"' + ($a -replace '"', '\"') + '"' } else { $a } }
+
+# "500,2000" / "500 2000" / @('500','2000') -> 500, 2000
+function Split-IntList([string[]]$values) {
+    @($values | ForEach-Object { $_ -split '[,\s]+' } | Where-Object { $_ } | ForEach-Object { [int]$_ })
+}
 
 # Runs an executable to completion; returns wall seconds, CPU seconds, exit code and stdout.
 function Invoke-Measured([string]$exe, [string[]]$argv, [string]$tag) {
@@ -136,7 +143,7 @@ try {
 
     # --- wincrawl sweep -------------------------------------------------------------
     if ($Wincrawl) {
-        foreach ($c in $Concurrency) {
+        foreach ($c in (Split-IntList $Concurrency)) {
             $json = Join-Path $work "wincrawl-c$c.json"
             $argv = @('--dns', "127.0.0.1:$DnsPort", '-c', "$c", '--json', $json, '--quiet')
             if ($Threads -gt 0) { $argv += @('-t', "$Threads") }
@@ -159,7 +166,7 @@ try {
 
     # --- legacy sweep -----------------------------------------------------------
     if ($Legacy) {
-        foreach ($t in $LegacyThreads) {
+        foreach ($t in (Split-IntList $LegacyThreads)) {
             Write-Host "legacy $t threads ..."
             $cpu0 = Get-ServerCpu $server
             $r = Invoke-Measured $Legacy @("$t", $ipUrls) "legacy-t$t"

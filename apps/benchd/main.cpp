@@ -65,8 +65,6 @@ const char kUsage[] =
     "  --chunked F              fraction of 200 pages sent chunked (0.1)\n"
     "  --http-delay-ms M[,J]    per-request response delay, M +/- J ms (0)\n"
     "  --idle-timeout-ms MS     reset idle connections after MS (30000)\n"
-    "  --graceful-close         plain close after Connection: close responses (leaves\n"
-    "                           TIME_WAIT on the server) instead of FIN + wait + reset\n"
     "  --duration S             exit after S seconds (default: run until Ctrl+C)\n"
     "  --stats-interval MS      periodic stats line period (2000)\n"
     "  --quiet                  no periodic lines\n"
@@ -191,7 +189,6 @@ int cmd_serve(Args& args) {
         else if (a == "--chunked") b.chunked = args.fraction(a);
         else if (a == "--http-delay-ms") http_delay = args.delay(a);
         else if (a == "--idle-timeout-ms") http_cfg.idle_timeout_ms = static_cast<uint32_t>(args.integer(a));
-        else if (a == "--graceful-close") http_cfg.graceful_close = true;
         else if (a == "--duration") duration_s = args.integer(a);
         else if (a == "--stats-interval") interval_ms = args.integer(a);
         else if (a == "--quiet") quiet = true;
@@ -243,10 +240,9 @@ int cmd_serve(Args& args) {
     }
     if (http) {
         std::printf("  http tcp %s  %u workers  robots-404 %.2f page %u KB links %u 3xx %.2f 404 %.2f 5xx %.2f "
-                    "chunked %.2f delay %u+-%u ms%s\n",
+                    "chunked %.2f delay %u+-%u ms\n",
                     net::to_string(http->local_address()).c_str(), http_cfg.threads, b.robots_404, b.page_kb, b.links,
-                    b.redirect, b.not_found, b.server_error, b.chunked, b.http_delay.mean_ms, b.http_delay.jitter_ms,
-                    http_cfg.graceful_close ? " graceful-close" : "");
+                    b.redirect, b.not_found, b.server_error, b.chunked, b.http_delay.mean_ms, b.http_delay.jitter_ms);
     }
     std::printf("ready\n");
     std::fflush(stdout);

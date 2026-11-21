@@ -115,7 +115,7 @@ RequestParse parse_request(const char* data, size_t len, HttpRequest& out) {
 
 // ---------------------------------------------------------------------------
 
-enum class ConnState : uint8_t { Free, Reading, Delaying, Sending, Draining, Closing };
+enum class ConnState : uint8_t { Free, Reading, Delaying, Sending, Closing };
 
 struct Conn final : net::TcpHandler {
     Conn(HttpWorker& w, net::Loop& loop) : worker(w), socket(loop, *this), buf(new char[kRecvBuffer]) {}
@@ -195,15 +195,12 @@ public:
             return;
         }
         if (error != 0 || bytes == 0) {
-            // Peer is done (FIN or RST): reset so nobody keeps TIME_WAIT.
+            // Peer is done (FIN or RST). Resetting from CLOSE_WAIT moves the
+            // peer from FIN_WAIT_2 straight to CLOSED: no TIME_WAIT anywhere.
             abort(c);
             return;
         }
         c.last_active = loop_.now();
-        if (c.state == ConnState::Draining) {
-            c.socket.recv(c.buf.get(), kRecvBuffer);  // discard until the peer closes
-            return;
-        }
         c.len += bytes;
         serve(c);
     }
@@ -220,16 +217,15 @@ public:
         count_response(c);
         c.last_active = loop_.now();
         if (c.close_after) {
-            if (config_.graceful_close) {
-                c.socket.close(false);
-                c.state = ConnState::Closing;
-                release_if_idle(c);
-                return;
-            }
-            // Half-close; the client's FIN/RST (or the idle sweep) finishes it with a reset.
-            ::shutdown(c.socket.native_handle(), SD_SEND);
-            c.state = ConnState::Draining;
-            c.socket.recv(c.buf.get(), kRecvBuffer);
+            // Close-delimited readers (HTTP/1.0, the legacy crawler) need our
+            // FIN, so this is a normal close and the server side keeps the
+            // TIME_WAIT. That costs no client ephemeral ports, and clients that
+            // read by length and reset first (wc::net's default) avoid it. On
+            // Windows an abortive close after shutdown(SD_SEND) does not send
+            // an RST, so there is no cheaper way out for EOF readers.
+            c.socket.close(false);
+            c.state = ConnState::Closing;
+            release_if_idle(c);
             return;
         }
         std::memmove(c.buf.get(), c.buf.get() + c.req_len, c.len - c.req_len);
@@ -374,8 +370,7 @@ private:
         const uint64_t now = loop_.now();
         for (Conn* c = live_; c != nullptr;) {
             Conn* next = c->next;
-            if ((c->state == ConnState::Reading || c->state == ConnState::Draining) &&
-                now - c->last_active >= config_.idle_timeout_ms) {
+            if (c->state == ConnState::Reading && now - c->last_active >= config_.idle_timeout_ms) {
                 abort(*c);
             }
             c = next;
