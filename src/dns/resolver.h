@@ -57,7 +57,8 @@ public:
         uint64_t cancelled = 0;  // failed by shutdown()
         uint64_t invalid = 0;
         uint64_t literals = 0;    // IPv4 literals answered without a query
-        uint64_t mismatched = 0;  // well-formed replies rejected: source, txid, QR or question
+        uint64_t late = 0;        // replies whose txid is no longer in flight
+        uint64_t mismatched = 0;  // other well-formed rejects: source, QR, question
         uint64_t malformed = 0;   // replies that failed to parse
     };
 

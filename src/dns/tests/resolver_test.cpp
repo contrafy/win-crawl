@@ -327,7 +327,10 @@ TEST_CASE("resolver: rejects replies with wrong source, txid or question") {
     resolver.resolve("spoof.test", into(spoofed));
     resolver.resolve("alt-only.test", into(alt_only));
     REQUIRE(run_until(loop, [&] {
-        return spoofed.done && alt_only.done && resolver.counters().mismatched == 4 &&
+        // The wrong-txid reply is normally "late" (txid not in flight) and only
+        // "mismatched" if it happens to hit the other query's txid.
+        const auto& c = resolver.counters();
+        return spoofed.done && alt_only.done && c.mismatched + c.late == 4 &&
                resolver.counters().malformed == 1;
     }));
     CHECK(spoofed.status == Status::Ok);

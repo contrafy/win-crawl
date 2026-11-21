@@ -225,8 +225,12 @@ void Resolver::on_datagram(net::UdpSocket&, const char* data, size_t len, const 
         return;
     }
     const uint16_t slot_ref = by_txid_[r.id];
-    if (slot_ref == 0 || !r.qr || r.qtype != kTypeA || r.qclass != kClassIn) {
+    if (!r.qr || r.qtype != kTypeA || r.qclass != kClassIn) {
         ++counters_.mismatched;
+        return;
+    }
+    if (slot_ref == 0) {
+        ++counters_.late;  // usually the first server answering after a retry already completed the query
         return;
     }
     const uint32_t index = slot_ref - 1u;
