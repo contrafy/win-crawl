@@ -8,8 +8,11 @@
 #include <winsock2.h>
 #include <windows.h>
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
+#include <mutex>
+#include <vector>
 
 namespace wc::net {
 
@@ -62,6 +65,48 @@ public:
     void cancel_timer(TimerId id);
 
     HANDLE port() const;
+
+private:
+    // Timers live in a slot table (stable ids: generation << 32 | slot) and an
+    // indexed binary min-heap over (deadline, seq), so cancel is O(log n) and
+    // never leaves stale heap entries behind. seq keeps equal deadlines FIFO.
+    static constexpr uint32_t kNotQueued = UINT32_MAX;
+    struct TimerSlot {
+        std::function<void()> fn;
+        uint32_t gen = 1;
+        uint32_t heap_pos = kNotQueued;
+    };
+    struct TimerEntry {
+        uint64_t deadline;
+        uint64_t seq;
+        uint32_t slot;
+    };
+
+    DWORD wait_timeout_ms() const;
+    void dispatch(const OVERLAPPED_ENTRY* entries, ULONG count);
+    void run_timers();
+    void run_posted();
+    bool heap_less(const TimerEntry& a, const TimerEntry& b) const;
+    void heap_place(size_t pos, const TimerEntry& entry);
+    void heap_sift_up(size_t pos, TimerEntry entry);
+    void heap_sift_down(size_t pos, TimerEntry entry);
+    void heap_remove(size_t pos);
+    void release_slot(uint32_t slot);
+
+    HANDLE port_ = nullptr;
+    uint64_t now_ = 0;
+    std::atomic<bool> stop_{false};
+    std::vector<OVERLAPPED_ENTRY> entries_;
+
+    std::vector<TimerSlot> timer_slots_;
+    std::vector<uint32_t> free_timer_slots_;
+    std::vector<TimerEntry> timer_heap_;
+    uint64_t timer_seq_ = 0;
+
+    std::mutex post_mutex_;
+    std::vector<std::function<void()>> posted_;   // guarded by post_mutex_
+    bool wake_pending_ = false;                   // guarded by post_mutex_
+    std::vector<std::function<void()>> running_;  // loop thread only
 };
 
 }  // namespace wc::net
