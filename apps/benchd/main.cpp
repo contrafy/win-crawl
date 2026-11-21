@@ -43,7 +43,8 @@ const char kUsage[] =
     "  wincrawl-benchd load [load options] HTTP load generator against a running server\n"
     "\n"
     "serve options:\n"
-    "  --dns ADDR[:PORT]        DNS listen address (default 127.0.0.1:5353)\n"
+    "  --dns ADDR[:PORT]        DNS listen address (default 127.0.0.1:5300; not 5353,\n"
+    "                           which mDNS in Chrome / the DNS Client service holds)\n"
     "  --http ADDR[:PORT]       HTTP listen address (default 0.0.0.0:8080; 0.0.0.0 lets\n"
     "                           clients reach every 127.0.0.0/8 address the DNS hands out)\n"
     "  --no-dns | --no-http     run only one of the servers\n"
@@ -160,7 +161,7 @@ int cmd_serve(Args& args) {
     HttpServerConfig http_cfg;
     sockaddr_in dns_addr{};
     sockaddr_in http_addr{};
-    net::parse_addr("127.0.0.1", 5353, dns_addr);
+    net::parse_addr("127.0.0.1", 5300, dns_addr);
     net::parse_addr("0.0.0.0", 8080, http_addr);
     bool run_dns = true, run_http = true, quiet = false;
     std::optional<Delay> dns_delay, http_delay;
@@ -170,7 +171,7 @@ int cmd_serve(Args& args) {
 
     std::string_view a;
     while (args.next(a)) {
-        if (a == "--dns") dns_addr = args.address(a, 5353);
+        if (a == "--dns") dns_addr = args.address(a, 5300);
         else if (a == "--http") http_addr = args.address(a, 8080);
         else if (a == "--no-dns") run_dns = false;
         else if (a == "--no-http") run_http = false;

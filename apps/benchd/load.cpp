@@ -129,7 +129,9 @@ void Client::start() {
     if (worker_.stopping()) return;
     const LoadOptions& o = worker_.options();
     if (socket_.open() != 0) {
+        // Typically WSAENOBUFS: the machine ran out of ephemeral ports. Retry later.
         bump(worker_.stats.errors);
+        worker_.loop().add_timer(50, [this] { start(); });
         return;
     }
     sockaddr_in to = o.target;

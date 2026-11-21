@@ -30,7 +30,7 @@ param(
     [int]$Threads = 0,                    # wincrawl -t (0 = its default)
     [int]$ServerThreads = 4,              # benchd HTTP worker loops
     [int]$HttpPort = 8080,
-    [int]$DnsPort = 5353,
+    [int]$DnsPort = 5300,                 # not 5353: mDNS (Chrome, DNS Client) holds it
     [string[]]$ServeArgs = @(),           # extra `serve` options, e.g. '--page-kb','64'
     [string[]]$CrawlArgs = @(),           # extra wincrawl options
     [int]$RunTimeoutSec = 1800,

@@ -463,7 +463,8 @@ HttpServer::HttpServer(const Behavior& behavior, const HttpServerConfig& config)
 HttpServer::~HttpServer() { stop(); }
 
 DWORD HttpServer::start(const sockaddr_in& local) {
-    const DWORD err = acceptor_->listener().listen(local, SOMAXCONN, config_.accept_depth);
+    // Plain SOMAXCONN gives ~200 on Windows; crawler connect bursts need far more.
+    const DWORD err = acceptor_->listener().listen(local, SOMAXCONN_HINT(16384), config_.accept_depth);
     if (err != 0) return err;
     local_ = acceptor_->listener().local_address();
     responses_ = std::make_unique<ResponseSet>(behavior_, ntohs(local_.sin_port));
