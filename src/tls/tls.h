@@ -61,7 +61,8 @@ public:
     State feed(const char* data, size_t len, std::vector<char>& wire_out, std::vector<char>& plain_out);
 
     // Encrypts application data into records (split at the negotiated maximum record
-    // size) appended to `wire_out`. Only valid while Established.
+    // size) appended to `wire_out`. Returns false unless Established; calling it before
+    // the handshake completes is Failure::Misuse, after Closed/Failed it changes nothing.
     bool encrypt(const char* data, size_t len, std::vector<char>& wire_out);
 
     // Appends a close_notify alert to `wire_out`. Valid while Established or after the

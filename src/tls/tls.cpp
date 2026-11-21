@@ -339,7 +339,9 @@ ClientSession::State ClientSession::decrypt_step(std::vector<char>& plain_out) {
 
 bool ClientSession::encrypt(const char* data, size_t len, std::vector<char>& wire_out) {
     if (state_ != State::Established) {
-        if (state_ != State::Failed)
+        // Writing after close is an ordinary race with the peer, not a bug; writing
+        // before the handshake finished is.
+        if (state_ == State::Idle || state_ == State::Handshaking)
             fail(Failure::Misuse, SEC_E_INVALID_HANDLE);
         return false;
     }

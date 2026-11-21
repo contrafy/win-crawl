@@ -225,6 +225,7 @@ TEST_CASE("client close_notify reaches the server") {
     CHECK(h.server.closed());
     std::vector<char> out;
     CHECK(!h.client.encrypt("x", 1, out));
+    CHECK(h.client.state() == State::Closed);
     CHECK(out.empty());
 }
 
