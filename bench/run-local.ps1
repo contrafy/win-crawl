@@ -36,6 +36,10 @@ param(
     [string[]]$ServeArgs = @(),           # extra `serve` options, e.g. '--page-kb','64'
     [string[]]$CrawlArgs = @(),           # extra wincrawl options
     [int]$RunTimeoutSec = 1800,
+    # Before each run, wait up to this long for TIME_WAIT sockets on the HTTP
+    # port (left by close-per-request clients such as the legacy crawler) to
+    # drain: a large TIME_WAIT population slows every new loopback connection.
+    [int]$SettleSec = 150,
     [string]$OutDir
 )
 
@@ -97,9 +101,18 @@ function Invoke-Measured([string]$exe, [string[]]$argv, [string]$tag) {
     }
 }
 
+# netstat is O(seconds) with 10^5 entries; Get-NetTCPConnection takes minutes.
 function Get-TimeWaitCount {
-    @(Get-NetTCPConnection -State TimeWait -ErrorAction SilentlyContinue |
-        Where-Object { $_.LocalPort -eq $HttpPort -or $_.RemotePort -eq $HttpPort }).Count
+    @(@(netstat -an -p TCP) -match 'TIME_WAIT' -match ":$HttpPort\s").Count
+}
+
+function Wait-Settled {
+    if ($SettleSec -le 0) { return }
+    $deadline = (Get-Date).AddSeconds($SettleSec)
+    while (($n = Get-TimeWaitCount) -gt 1000 -and (Get-Date) -lt $deadline) {
+        Write-Host "  waiting for $n TIME_WAIT sockets on :$HttpPort to expire ..."
+        Start-Sleep -Seconds 10
+    }
 }
 
 function Get-ServerCpu($proc) { $proc.Refresh(); $proc.TotalProcessorTime.TotalSeconds }
@@ -149,6 +162,7 @@ try {
             if ($Threads -gt 0) { $argv += @('-t', "$Threads") }
             $argv += $CrawlArgs
             $argv += $urls
+            Wait-Settled
             Write-Host "wincrawl -c $c ..."
             $cpu0 = Get-ServerCpu $server
             $r = Invoke-Measured $Wincrawl $argv "wincrawl-c$c"
@@ -167,6 +181,7 @@ try {
     # --- legacy sweep -----------------------------------------------------------
     if ($Legacy) {
         foreach ($t in (Split-IntList $LegacyThreads)) {
+            Wait-Settled
             Write-Host "legacy $t threads ..."
             $cpu0 = Get-ServerCpu $server
             $r = Invoke-Measured $Legacy @("$t", $ipUrls) "legacy-t$t"

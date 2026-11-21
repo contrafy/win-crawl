@@ -59,17 +59,18 @@ shared immutable buffer (HEAD sends its header prefix). One acceptor loop
 worker loops. HTTP/1.1 keep-alive and pipelining, HTTP/1.0 close unless
 `Connection: keep-alive`.
 
-Connection teardown is chosen so that neither side accumulates TIME_WAIT:
+Connection teardown:
 
-- after a response to a client that asked for close, the server half-closes
-  (`shutdown(SD_SEND)` → FIN; the client sees EOF, which close-delimited
-  HTTP/1.0 readers such as the legacy crawler need), then waits for the
-  client's FIN/RST and resets (`SO_LINGER {1,0}`). The client ends in
-  LAST_ACK → CLOSED, the server never enters TIME_WAIT.
-- a keep-alive client that closes (FIN or RST) is reset as well; idle
-  connections (`--idle-timeout-ms`, default 30 s) and shutdown are resets.
-- `--graceful-close` switches the first case to a plain close for comparison
-  (TIME_WAIT then lands on the server, one entry per connection for 2 MSL).
+- a client that closes or resets a keep-alive connection is answered with an
+  abortive close (`SO_LINGER {1,0}` → RST). The client goes FIN_WAIT_2 →
+  CLOSED and nobody keeps a TIME_WAIT entry. Idle connections
+  (`--idle-timeout-ms`, default 30 s) and shutdown are resets too.
+- a response to a client that asked for close (`Connection: close`, HTTP/1.0)
+  is followed by a normal close: close-delimited readers such as the legacy
+  crawler need the FIN. The server is then the active closer and keeps one
+  TIME_WAIT entry per connection for 2 MSL (120 s on Windows). Clients that
+  read by length and reset first avoid it; EOF readers cannot (see the
+  tuning notes for why and what it costs).
 
 ## Running
 
