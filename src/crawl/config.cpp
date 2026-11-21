@@ -1,0 +1,418 @@
+#include "crawl/config.h"
+
+#include <windows.h>
+
+#include <charconv>
+#include <string_view>
+
+namespace wc::crawl {
+
+namespace {
+
+constexpr uint64_t kKiB = 1024;
+constexpr uint64_t kGiB = 1024 * 1024 * 1024;
+
+enum class Opt {
+    Mode,
+    Threads,
+    Concurrency,
+    Dns,
+    DnsInflight,
+    DnsTimeout,
+    DnsAttempts,
+    ConnectTimeout,
+    Timeout,
+    RobotsLimit,
+    PageLimit,
+    NoKeepalive,
+    Insecure,
+    MaxRedirects,
+    StatsInterval,
+    Json,
+    Quiet,
+    Help,
+};
+
+struct OptSpec {
+    Opt opt;
+    std::string_view long_name;
+    char short_name;  // 0 = none
+    bool takes_value;
+};
+
+constexpr OptSpec kOptions[] = {
+    {Opt::Mode, "mode", 0, true},
+    {Opt::Threads, "threads", 't', true},
+    {Opt::Concurrency, "concurrency", 'c', true},
+    {Opt::Dns, "dns", 0, true},
+    {Opt::DnsInflight, "dns-inflight", 0, true},
+    {Opt::DnsTimeout, "dns-timeout", 0, true},
+    {Opt::DnsAttempts, "dns-attempts", 0, true},
+    {Opt::ConnectTimeout, "connect-timeout", 0, true},
+    {Opt::Timeout, "timeout", 0, true},
+    {Opt::RobotsLimit, "robots-limit", 0, true},
+    {Opt::PageLimit, "page-limit", 0, true},
+    {Opt::NoKeepalive, "no-keepalive", 0, false},
+    {Opt::Insecure, "insecure", 0, false},
+    {Opt::MaxRedirects, "max-redirects", 0, true},
+    {Opt::StatsInterval, "stats-interval", 0, true},
+    {Opt::Json, "json", 0, true},
+    {Opt::Quiet, "quiet", 'q', false},
+    {Opt::Help, "help", 'h', false},
+};
+
+const OptSpec* find_long(std::string_view name) {
+    for (const OptSpec& spec : kOptions) {
+        if (spec.long_name == name) {
+            return &spec;
+        }
+    }
+    return nullptr;
+}
+
+const OptSpec* find_short(char name) {
+    for (const OptSpec& spec : kOptions) {
+        if (spec.short_name != 0 && spec.short_name == name) {
+            return &spec;
+        }
+    }
+    return nullptr;
+}
+
+std::string display(const OptSpec& spec) {
+    return "--" + std::string(spec.long_name);
+}
+
+bool parse_u64(std::string_view text, uint64_t& out) {
+    if (text.empty()) {
+        return false;
+    }
+    const auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), out);
+    return ec == std::errc() && ptr == text.data() + text.size();
+}
+
+// Integer in [lo, hi].
+bool parse_range(std::string_view text, uint64_t lo, uint64_t hi, uint64_t& out) {
+    return parse_u64(text, out) && out >= lo && out <= hi;
+}
+
+// Byte count with an optional binary suffix: 16384, 16K, 2M, 1G.
+bool parse_bytes(std::string_view text, uint64_t lo, uint64_t hi, uint64_t& out) {
+    uint64_t scale = 1;
+    if (!text.empty()) {
+        switch (text.back()) {
+        case 'k': case 'K': scale = kKiB; break;
+        case 'm': case 'M': scale = kKiB * kKiB; break;
+        case 'g': case 'G': scale = kGiB; break;
+        default: break;
+        }
+        if (scale != 1) {
+            text.remove_suffix(1);
+        }
+    }
+    uint64_t v = 0;
+    if (!parse_u64(text, v) || v > hi / scale) {
+        return false;
+    }
+    out = v * scale;
+    return out >= lo && out <= hi;
+}
+
+bool parse_ipv4(std::string_view text, uint32_t& out_be) {
+    uint8_t octets[4];
+    for (int i = 0; i < 4; ++i) {
+        const size_t dot = i < 3 ? text.find('.') : text.size();
+        if (dot == std::string_view::npos || dot == 0 || dot > 3) {
+            return false;
+        }
+        uint64_t v = 0;
+        if (!parse_range(text.substr(0, dot), 0, 255, v)) {
+            return false;
+        }
+        octets[i] = static_cast<uint8_t>(v);
+        text.remove_prefix(i < 3 ? dot + 1 : dot);
+    }
+    // Network byte order: first octet in the lowest-addressed byte.
+    out_be = static_cast<uint32_t>(octets[0]) | static_cast<uint32_t>(octets[1]) << 8 |
+             static_cast<uint32_t>(octets[2]) << 16 | static_cast<uint32_t>(octets[3]) << 24;
+    return true;
+}
+
+// "ADDR[:PORT][,ADDR[:PORT]...]"
+bool parse_dns_list(std::string_view text, std::vector<DnsServer>& out) {
+    std::vector<DnsServer> servers;
+    while (true) {
+        const size_t comma = text.find(',');
+        std::string_view item = text.substr(0, comma);
+        DnsServer server;
+        const size_t colon = item.find(':');
+        if (colon != std::string_view::npos) {
+            uint64_t port = 0;
+            if (!parse_range(item.substr(colon + 1), 1, 65535, port)) {
+                return false;
+            }
+            server.port = static_cast<uint16_t>(port);
+            item = item.substr(0, colon);
+        }
+        if (!parse_ipv4(item, server.ipv4_be)) {
+            return false;
+        }
+        servers.push_back(server);
+        if (comma == std::string_view::npos) {
+            break;
+        }
+        text.remove_prefix(comma + 1);
+    }
+    out = std::move(servers);
+    return true;
+}
+
+ParseResult error(std::string message) {
+    return ParseResult{ParseStatus::Error, std::move(message), {}};
+}
+
+// Options whose defaults depend on whether they were given explicitly.
+struct Given {
+    bool robots_limit = false;
+    bool dns_inflight = false;
+};
+
+// Applies one option. `value` is empty for flags.
+ParseResult apply(const OptSpec& spec, std::string_view value, Config& cfg, Given& given) {
+    uint64_t v = 0;
+    auto bad = [&](const char* expected) {
+        return error("invalid value '" + std::string(value) + "' for " + display(spec) + ": expected " + expected);
+    };
+    switch (spec.opt) {
+    case Opt::Mode:
+        if (value == "classic") {
+            cfg.mode = Mode::Classic;
+        } else if (value == "real") {
+            cfg.mode = Mode::Real;
+        } else {
+            return bad("classic or real");
+        }
+        break;
+    case Opt::Threads:
+        if (!parse_range(value, 1, 1024, v)) return bad("an integer in 1..1024");
+        cfg.threads = static_cast<unsigned>(v);
+        break;
+    case Opt::Concurrency:
+        if (!parse_range(value, 1, 1000000, v)) return bad("an integer in 1..1000000");
+        cfg.concurrency = static_cast<unsigned>(v);
+        break;
+    case Opt::Dns:
+        if (value == "system") {
+            cfg.dns_system = true;
+            cfg.dns_servers.clear();
+            break;
+        }
+        if (!parse_dns_list(value, cfg.dns_servers)) return bad("system or IPv4[:port][,IPv4[:port]...]");
+        cfg.dns_system = false;
+        break;
+    case Opt::DnsInflight:
+        if (!parse_range(value, 1, 65535, v)) return bad("an integer in 1..65535");
+        cfg.dns_inflight = static_cast<unsigned>(v);
+        given.dns_inflight = true;
+        break;
+    case Opt::DnsTimeout:
+        if (!parse_range(value, 1, 60000, v)) return bad("milliseconds in 1..60000");
+        cfg.dns_timeout_ms = static_cast<unsigned>(v);
+        break;
+    case Opt::DnsAttempts:
+        if (!parse_range(value, 1, 10, v)) return bad("an integer in 1..10");
+        cfg.dns_attempts = static_cast<unsigned>(v);
+        break;
+    case Opt::ConnectTimeout:
+        if (!parse_range(value, 1, 600000, v)) return bad("milliseconds in 1..600000");
+        cfg.connect_timeout_ms = static_cast<unsigned>(v);
+        break;
+    case Opt::Timeout:
+        if (!parse_range(value, 1, 3600000, v)) return bad("milliseconds in 1..3600000");
+        cfg.timeout_ms = static_cast<unsigned>(v);
+        break;
+    case Opt::RobotsLimit:
+        if (!parse_bytes(value, 1, kGiB, v)) return bad("bytes in 1..1G (K/M/G suffixes allowed)");
+        cfg.robots_limit = v;
+        given.robots_limit = true;
+        break;
+    case Opt::PageLimit:
+        if (!parse_bytes(value, 1, kGiB, v)) return bad("bytes in 1..1G (K/M/G suffixes allowed)");
+        cfg.page_limit = v;
+        break;
+    case Opt::NoKeepalive:
+        cfg.keepalive = false;
+        break;
+    case Opt::Insecure:
+        cfg.insecure = true;
+        break;
+    case Opt::MaxRedirects:
+        if (!parse_range(value, 0, 20, v)) return bad("an integer in 0..20");
+        cfg.max_redirects = static_cast<unsigned>(v);
+        break;
+    case Opt::StatsInterval:
+        if (!parse_range(value, 100, 3600000, v)) return bad("milliseconds in 100..3600000");
+        cfg.stats_interval_ms = static_cast<unsigned>(v);
+        break;
+    case Opt::Json:
+        if (value.empty()) return bad("a file path");
+        cfg.json_path = std::string(value);
+        break;
+    case Opt::Quiet:
+        cfg.quiet = true;
+        break;
+    case Opt::Help:
+        return ParseResult{ParseStatus::Help, {}};
+    }
+    return {};
+}
+
+}  // namespace
+
+const char* mode_name(Mode mode) {
+    return mode == Mode::Real ? "real" : "classic";
+}
+
+unsigned logical_cpu_count() {
+    const DWORD n = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    return n == 0 ? 1u : static_cast<unsigned>(n);
+}
+
+ParseResult parse_args(int argc, const char* const* argv, Config& out) {
+    Config cfg;
+    Given given;
+    bool options_done = false;
+    std::vector<std::string_view> positional;
+
+    for (int i = 1; i < argc; ++i) {
+        const std::string_view arg = argv[i];
+        if (options_done || arg.size() < 2 || arg[0] != '-') {
+            positional.push_back(arg);
+            continue;
+        }
+        if (arg == "--") {
+            options_done = true;
+            continue;
+        }
+
+        const OptSpec* spec = nullptr;
+        std::string_view value;
+        bool has_inline_value = false;
+        if (arg[1] == '-') {
+            std::string_view name = arg.substr(2);
+            const size_t eq = name.find('=');
+            if (eq != std::string_view::npos) {
+                value = name.substr(eq + 1);
+                name = name.substr(0, eq);
+                has_inline_value = true;
+            }
+            spec = find_long(name);
+            if (spec == nullptr) {
+                return error("unknown option --" + std::string(name));
+            }
+        } else {
+            spec = find_short(arg[1]);
+            if (spec == nullptr) {
+                return error("unknown option " + std::string(arg));
+            }
+            if (arg.size() > 2) {
+                if (!spec->takes_value) {
+                    return error("unknown option " + std::string(arg));
+                }
+                value = arg.substr(2);  // -t8
+                has_inline_value = true;
+            }
+        }
+
+        if (spec->takes_value && !has_inline_value) {
+            if (i + 1 >= argc) {
+                return error("option " + display(*spec) + " needs a value");
+            }
+            value = argv[++i];
+        } else if (!spec->takes_value && has_inline_value) {
+            return error("option " + display(*spec) + " takes no value");
+        }
+
+        ParseResult r = apply(*spec, value, cfg, given);
+        if (r.status != ParseStatus::Ok) {
+            return r;
+        }
+    }
+
+    if (positional.empty()) {
+        return error("missing <url-file>");
+    }
+    if (positional.size() > 1) {
+        return error("unexpected argument '" + std::string(positional[1]) + "' (only one <url-file> is accepted)");
+    }
+    cfg.input_path = std::string(positional[0]);
+
+    if (cfg.threads == 0) {
+        cfg.threads = logical_cpu_count();
+    }
+    // A loop without a single task slot would only burn a core.
+    if (cfg.threads > cfg.concurrency) {
+        cfg.threads = cfg.concurrency;
+    }
+    if (!given.robots_limit) {
+        cfg.robots_limit = cfg.mode == Mode::Real ? kRealRobotsLimit : kClassicRobotsLimit;
+    }
+    ParseResult result;
+    if (cfg.dns_system && !given.dns_inflight && cfg.dns_inflight > kSystemDnsInflight) {
+        // OS-configured resolvers (typically a home router) drop most queries
+        // beyond a few dozen in flight.
+        cfg.dns_inflight = kSystemDnsInflight;
+        result.notes.push_back("note: --dns system caps DNS in-flight queries at " +
+                               std::to_string(kSystemDnsInflight) + " (raise with --dns-inflight)");
+    }
+    out = std::move(cfg);
+    return result;
+}
+
+std::string usage_text() {
+    return R"(usage: wincrawl [options] <url-file>
+
+Crawls every URL in <url-file> (one per line) with per-core IOCP event loops.
+
+Modes:
+  --mode classic|real     classic (default): the CSCE 463 pipeline: http only,
+                          unique host -> DNS -> unique IP -> HEAD /robots.txt,
+                          GET the page only when robots answers 4xx.
+                          real: http + https, GET /robots.txt honoured per
+                          RFC 9309, redirects followed, TLS via Schannel.
+
+Engine:
+  -t, --threads N         event loops (default: logical CPUs; capped at -c)
+  -c, --concurrency N     max in-flight URL tasks across all loops (default 4000)
+
+DNS:
+  --dns ADDR[:PORT][,...] DNS servers (default 1.1.1.1,1.0.0.1); use --dns system
+                          for the OS-configured servers (in-flight then capped
+                          at 64 unless --dns-inflight is given)
+  --dns-inflight N        max outstanding DNS queries in total (default 2048)
+  --dns-timeout MS        per-attempt timeout (default 1500)
+  --dns-attempts N        attempts per name (default 3)
+
+HTTP:
+  --connect-timeout MS    TCP connect timeout (default 5000)
+  --timeout MS            total time per fetch, connect included (default 10000)
+  --robots-limit BYTES    robots.txt reply cap (default 16K classic, 512K real)
+  --page-limit BYTES      page reply cap (default 2M); K/M/G suffixes allowed
+  --no-keepalive          fresh connection per request; in classic mode also
+                          HTTP/1.0 requests like the original crawler
+  --insecure              real mode: skip TLS certificate verification
+  --max-redirects N       real mode: redirects followed per page (default 5)
+
+Output:
+  --stats-interval MS     periodic status interval (default 2000)
+  --json FILE             write the final statistics as JSON to FILE
+  -q, --quiet             no periodic status lines
+  -h, --help              this text
+
+Ctrl+C stops taking URLs, aborts what is in flight and prints the summary.
+Exit codes: 0 run completed, 1 fatal error (e.g. unreadable input), 2 usage error,
+130 interrupted by Ctrl+C.
+)";
+}
+
+}  // namespace wc::crawl

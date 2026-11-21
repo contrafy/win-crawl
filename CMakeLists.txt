@@ -48,12 +48,3 @@ foreach(list_file IN LISTS WC_MODULE_LISTS)
   get_filename_component(module_dir ${list_file} DIRECTORY)
   add_subdirectory(${module_dir})
 endforeach()
-
-# Original coursework crawler (thread per connection), kept until the new engine replaces it.
-add_executable(wincrawl_legacy main.cpp Crawler.cpp Socket.cpp Utility.cpp)
-target_compile_options(wincrawl_legacy PRIVATE /W3)
-# HTMLParserBase.h selects the course-provided parser library via #pragma comment(lib).
-target_link_directories(wincrawl_legacy PRIVATE ${PROJECT_SOURCE_DIR})
-target_link_libraries(wincrawl_legacy PRIVATE ws2_32)
-# The course library was built with /GL by MSVC 2015; mixing it with our own /GL objects fails (C1047).
-set_target_properties(wincrawl_legacy PROPERTIES INTERPROCEDURAL_OPTIMIZATION_RELEASE OFF)
