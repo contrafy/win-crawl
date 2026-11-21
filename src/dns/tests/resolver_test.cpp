@@ -253,6 +253,7 @@ TEST_CASE("resolver: answers, negative replies, literals and invalid names") {
     CHECK(c.ok == 3);  // literals are counted separately
     CHECK(c.nxdomain == 1);
     CHECK(c.noanswer == 2);
+    CHECK(c.truncated == 1);
     CHECK(c.literals == 1);
     CHECK(c.invalid == 1);
     CHECK(c.timeouts == 1);

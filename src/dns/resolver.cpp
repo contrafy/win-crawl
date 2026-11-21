@@ -241,7 +241,10 @@ void Resolver::on_datagram(net::UdpSocket&, const char* data, size_t len, const 
 
     switch (r.rcode) {
     case kNoError:
-        if (!r.tc && r.addr_count != 0) {
+        if (r.tc) {
+            ++counters_.truncated;
+            finish(index, Status::NoAnswer, 0);
+        } else if (r.addr_count != 0) {
             finish(index, Status::Ok, r.addrs[0]);
         } else {
             finish(index, Status::NoAnswer, 0);
