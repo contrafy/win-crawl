@@ -55,14 +55,15 @@ flowchart LR
         Ln[IOCP loop] --- Rn[DNS resolver]
         Ln --- Tn[task slots]
     end
-    W0 & W1 & Wn <-->|insert| D[(HostSet / IpSet<br/>256-way sharded)]
+    W0 & W1 & Wn <-->|insert / acquire| D[(HostSet + per-IP gates<br/>256-way sharded)]
     W0 & W1 & Wn -->|relaxed counters| S[Reporter thread]
 ```
 
 - **Share-nothing loops** (`src/net/loop.h`). One I/O completion port per
   worker thread. Everything a loop owns (sockets, timers, task state, its DNS
   resolver) is touched only on that thread, so the hot path has no locks. The
-  only shared state is the URL cursor (one atomic) and the host/IP sets.
+  only shared state is the URL cursor (one atomic), the host set, and the
+  per-IP politeness gates.
 - **Completion contract** (`src/net/tcp.h`). Every operation completes exactly
   once on the loop thread, never inline, including after `close()` (as
   `ERROR_OPERATION_ABORTED`). Timeouts are loop timers that `close()` the
@@ -72,16 +73,26 @@ flowchart LR
   is O(log n) and a stale id is a no-op. A crawl arms and cancels several
   timers per URL.
 - **Task pipeline** (`src/crawl/engine.cpp`). Each slot runs one URL through
-  parse → host dedupe → DNS → IP dedupe → robots → page → link count, then
-  claims the next URL. Workers claim only as many URLs as they have free
-  slots, so no loop hoards a backlog while others sit idle at the end.
+  parse → host dedupe → DNS → per-IP gate (host budget, concurrency, spacing)
+  → robots → page → link count, then claims the next URL. Workers claim only
+  as many URLs as they have free slots, so no loop hoards a backlog while
+  others sit idle at the end.
 - **Keep-alive.** The robots request and the page request share one HTTP/1.1
   connection when the server allows it, saving a TCP handshake (and, in real
   mode, a TLS handshake) per site. `--no-keepalive` restores the original
   HTTP/1.0 + `Connection: close` behaviour for comparison.
 - **Dedupe.** Hosts are stored as 64-bit hashes in 256 SRWLOCK-guarded
   open-addressing shards; for ~825K hosts the chance of any collision is about
-  2e-8. IPs are stored exactly.
+  2e-8. The assignment's IP dedupe is the per-IP gate with a host budget of 1.
+- **Politeness** (`src/crawl/politeness.h`). Per-IP gates are shared across
+  loops: each has a host budget (`--hosts-per-ip`), a connection cap and
+  minimum spacing between connection starts, a 429/503 back-off, and breakers
+  for unreachable or persistently throttling IPs. A site that has to wait
+  becomes a small queue entry, so it holds no socket and no task slot; the
+  gate wakes it on the loop that owns it. Cloudflare's anycast ranges get
+  separate, higher limits, because one edge IP fronts many unrelated origins.
+  Real mode also honours `Crawl-delay` and `Retry-After`. Details and
+  measurements: [`politeness.md`](politeness.md).
 - **Stats.** Each loop writes its own cache-line-aligned counter block with
   relaxed atomic load+store (no `lock` prefix); a reporter thread sums them
   every interval. The status line keeps the course's format.
@@ -208,9 +219,10 @@ ETW CPU sampling (xperf kernel session, stacks folded and rendered with
 - **Unit and end-to-end tests:** doctest suites per module, plus end-to-end
   crawls over loopback against in-process fake DNS and HTTP servers. CI runs
   them in Debug and Release on every push.
-- **Fuzzing:** a `fuzz` preset (clang-cl, ASan, libFuzzer) builds eight
+- **Fuzzing:** a `fuzz` preset (clang-cl, ASan, libFuzzer) builds nine
   targets: DNS responses, HTTPS RRs, HTTP responses, URLs, robots.txt, link
-  extraction, the bench server's DNS codec, and record serialization.
+  extraction, the bench server's DNS codec, record serialization, and the Web
+  Bot Auth signature/JWK parsers.
   - **Checks beyond crashes:** whole vs split-buffer HTTP parsing, URL round
     trips, robots matching against a reference matcher, count-only vs
     collecting link extraction, and the crawler's DNS codec against the rig's
@@ -218,6 +230,28 @@ ETW CPU sampling (xperf kernel session, stacks folded and rendered with
   - **CI:** fuzzes each target for 60 s and runs the unit tests under ASan.
   - **Local campaign:** ~335M executions found one bug, the quadratic robots
     matcher above. See [`fuzzing.md`](fuzzing.md).
+
+## Web Bot Auth
+
+With `--bot-auth-key` and `--signature-agent`, every request carries an
+[RFC 9421](https://www.rfc-editor.org/rfc/rfc9421) HTTP Message Signature per
+Cloudflare's [Web Bot Auth](https://blog.cloudflare.com/web-bot-auth) draft.
+
+- **What's signed:** Ed25519 over `@authority` and `signature-agent`, with
+  `created`/`expires` (60 s), a fresh nonce, the JWK thumbprint as `keyid`,
+  and `tag="web-bot-auth"`.
+- **Crypto:** Windows CNG has no Ed25519, so `src/sig/` uses vendored
+  Monocypher 4.0.3.
+- **Verified against:** the RFC 8032, RFC 9421 and draft test vectors, and
+  Cloudflare's `web-bot-auth` npm library in both directions.
+- **Cost:** about 23 µs per signature, with no allocation.
+- **Tooling:** `wincrawl-botauth` generates keys and verifies signatures
+  offline. `tools/bot-auth-directory/` is a Cloudflare Worker that serves the
+  signed key directory. Cloudflare's production endpoint already accepts the
+  format (401 "unknown public key" until the directory is deployed and
+  registered).
+
+Details: [`web-bot-auth.md`](web-bot-auth.md).
 
 ## Windows limits worth knowing
 

@@ -83,8 +83,8 @@ flowchart LR
 
 - **One IOCP event loop per core, sharing nothing.** Each loop owns its
   sockets, timers, task slots and DNS resolver, so the hot path takes no
-  locks. Loops share only an atomic cursor into the memory-mapped URL file
-  and two sharded dedupe sets.
+  locks. Loops share only an atomic cursor into the memory-mapped URL file,
+  a sharded host set and sharded per-IP politeness gates.
 - **Own DNS resolver** over UDP with retries, server rotation, EDNS0 and an
   in-flight cap; it also looks up HTTPS records (RFC 9460). Defaults to
   1.1.1.1 / 1.0.0.1, which hold ~9–11K lookups/s where the home router
@@ -102,6 +102,15 @@ flowchart LR
   version and key exchange group, HTTP/3 and HSTS advertisement, and whether
   the site is behind Cloudflare. `tools/study/analyze.py` turns the records
   into a report.
+- **Polite by construction.** Per-IP connection caps and spacing enforced
+  across all loops, a per-IP host budget (`--hosts-per-ip`; 1 is the
+  assignment's IP dedupe), 429/503 back-off with `Retry-After`, robots.txt
+  `Crawl-delay`, and separate limits for anycast CDN edges
+  ([`docs/politeness.md`](docs/politeness.md)).
+- **Signed requests.** Optional [Web Bot Auth](https://blog.cloudflare.com/web-bot-auth)
+  signatures (RFC 9421, Ed25519) on every request, a key tool, and a
+  Cloudflare Worker for the key directory
+  ([`docs/web-bot-auth.md`](docs/web-bot-auth.md)).
 
 The full write-up, with measurements behind each decision, is in
 [`docs/design.md`](docs/design.md).
@@ -161,6 +170,9 @@ build\release\wincrawl.exe --json run.json --quiet sample_urls\URL-input-100.txt
 | `--no-pq` | | real mode: don't offer post-quantum key exchange |
 | `--record FILE` | | one JSON line per site ([schema](docs/study-method.md)) |
 | `--https-rr` | | also look up each host's HTTPS DNS record (needs `--record`) |
+| `--hosts-per-ip N` | 1 | hosts fetched per IP; 1 = assignment's IP dedupe, 0 = unlimited |
+| `--ip-concurrency N`, `--ip-interval MS` | 2, 250 | per-IP connection cap and spacing ([politeness](docs/politeness.md)) |
+| `--bot-auth-key FILE`, `--signature-agent URL` | | sign every request (Web Bot Auth) |
 
 Progress uses the course's status line format, printed every 2 s:
 
@@ -210,13 +222,16 @@ Reading left to right: elapsed seconds, then URLs in flight. Then:
 | `src/dns/` | DNS wire codec, system server discovery, async resolver |
 | `src/tls/` | Schannel client session (buffers in, buffers out) |
 | `src/parse/` | URL, HTTP/1.1, link extraction, robots.txt |
-| `src/crawl/` | engine, connection layer, dedupe, stats, CLI config |
+| `src/crawl/` | engine, connection layer, dedupe, politeness gates, stats, records, CLI config |
+| `src/sig/` | Ed25519 (vendored Monocypher), RFC 9421 signer/verifier, JWK |
 | `src/benchsrv/` | fake DNS + HTTP servers for tests and benchmarks |
 | `apps/wincrawl/` | the crawler |
+| `apps/botauth/` | `wincrawl-botauth`: key generation, signing and verification |
 | `apps/benchd/` | `wincrawl-benchd`: benchmark servers, URL generator, load generator |
 | `fuzz/` | libFuzzer targets, seed corpora and dictionaries |
-| `tools/study/` | measurement study analyzer |
+| `tools/study/` | measurement study analyzer and runtime estimator |
 | `tools/profile/` | ETW stack folding and flame graph rendering |
+| `tools/bot-auth-directory/` | Cloudflare Worker serving the signed Web Bot Auth key directory |
 | `bench/` | benchmark scripts, Unbound configs, notes and results |
 | `docs/` | design notes, study, profiling, fuzzing, roadmap |
 | `data/` | Cloudflare IPv4 ranges (compiled in) |
@@ -228,6 +243,6 @@ AddressSanitizer ([`docs/fuzzing.md`](docs/fuzzing.md)).
 
 ## What's next
 
-See [`docs/roadmap.md`](docs/roadmap.md). Next up: per-IP politeness (so
-studies can cover every host, not one per IP), Web Bot Auth request signing,
-the CPU savings the profiles point to, and a Linux io_uring backend.
+See [`docs/roadmap.md`](docs/roadmap.md). Next up: the CPU savings the
+profiles point to, a Linux io_uring backend, HTTP/3 over QUIC, and crawling
+the frontier IRLbot-style.
