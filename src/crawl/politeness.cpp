@@ -47,6 +47,7 @@ struct IpGates::Gate {
     uint32_t ip = 0;
     uint32_t hosts = 0;   // hosts charged to the budget
     uint32_t active = 0;  // connection slots held
+    uint32_t unstarted = 0;  // admitted through a wake or restart(), not connected yet
     uint32_t prio_waiting = 0;
     uint32_t penalty_ms = 0;
     uint16_t fails = 0;  // consecutive failed connections
@@ -157,6 +158,12 @@ uint32_t IpGates::spacing(const Gate& gate) const {
     return limits(gate).interval_ms + gate.penalty_ms;
 }
 
+// A start admitted through a wake or restart() has not connected yet: with
+// spacing in force nothing else starts until it reports started().
+bool IpGates::start_blocked(const Gate& gate) const {
+    return gate.unstarted > 0 && spacing(gate) > 0;
+}
+
 void IpGates::admit(Gate& gate, uint64_t now) {
     ++gate.active;
     gate.next_ms = std::max(gate.next_ms, now) + spacing(gate);
@@ -206,7 +213,7 @@ void IpGates::unlink(Gate& gate, GateWaiter* waiter) {
     waiter->next = nullptr;
 }
 
-void IpGates::note(Gate& gate, Outcome outcome, uint32_t retry_after_ms, uint64_t now) {
+void IpGates::note(Gate& gate, Outcome outcome, uint64_t now) {
     const IpLimits& lim = limits(gate);
     switch (outcome) {
     case Outcome::None:
@@ -229,11 +236,15 @@ void IpGates::note(Gate& gate, Outcome outcome, uint32_t retry_after_ms, uint64_
         if (!lim.backoff) {
             break;  // CDN edge: one origin's rate limit says nothing about the others
         }
+        // The spacing doubles (from at least 1 s) and the next start waits it
+        // out. A Retry-After is not applied to the whole IP: on shared
+        // hosting it is often one vhost's maintenance page (WordPress sends
+        // 503 with Retry-After: 600), which says nothing about the IP's
+        // other sites; the host itself waits it out (one retry, real mode).
         const uint32_t floor = std::max<uint32_t>(lim.interval_ms, 1000);
         const uint64_t doubled = std::max<uint64_t>(2ull * gate.penalty_ms, floor);
         gate.penalty_ms = static_cast<uint32_t>(std::min<uint64_t>(doubled, policy_.max_penalty_ms));
-        const uint64_t push = std::max<uint64_t>(gate.penalty_ms, std::min(retry_after_ms, policy_.max_penalty_ms));
-        gate.next_ms = std::max(gate.next_ms, now + push);
+        gate.next_ms = std::max(gate.next_ms, now + gate.penalty_ms);
         break;
     }
     }
@@ -258,6 +269,9 @@ uint32_t IpGates::dispatch(Gate& gate, uint64_t now, GateWaiter*& woken) {
         return 0;
     }
     while (gate.head != nullptr && has_room(gate)) {
+        if (start_blocked(gate)) {
+            return 0;  // started() dispatches again
+        }
         if (gate.next_ms > now) {
             if (gate.timer_armed) {
                 return 0;
@@ -269,6 +283,7 @@ uint32_t IpGates::dispatch(Gate& gate, uint64_t now, GateWaiter*& woken) {
         unlink(gate, w);
         w->state = GateWaiter::State::Admitted;
         admit(gate, now);
+        ++gate.unstarted;  // its owner loop connects later
         append(w);
     }
     return 0;
@@ -306,7 +321,7 @@ SeedResult IpGates::seed(uint32_t ip, GateWaiter* waiter, uint64_t now, GateEven
         }
         result.budget = gate.hosts == 0 ? Budget::First : Budget::Extra;
         ++gate.hosts;
-        if (gate.head == nullptr && has_room(gate) && gate.next_ms <= now) {
+        if (gate.head == nullptr && has_room(gate) && !start_blocked(gate) && gate.next_ms <= now) {
             admit(gate, now);
             result.admit = Admit::Now;
             return result;
@@ -330,7 +345,7 @@ Admit IpGates::acquire(uint32_t ip, GateWaiter* waiter, uint32_t max_waiters, ui
             return Admit::Unreachable;
         }
         // Sites under way go ahead of queued new sites.
-        if (gate.prio_waiting == 0 && has_room(gate) && gate.next_ms <= now) {
+        if (gate.prio_waiting == 0 && has_room(gate) && !start_blocked(gate) && gate.next_ms <= now) {
             admit(gate, now);
             return Admit::Now;
         }
@@ -344,17 +359,36 @@ Admit IpGates::acquire(uint32_t ip, GateWaiter* waiter, uint32_t max_waiters, ui
     return Admit::Queued;
 }
 
-uint32_t IpGates::restart(uint32_t ip, Outcome outcome, uint32_t retry_after_ms, uint64_t now) {
+uint32_t IpGates::restart(uint32_t ip, Outcome outcome, uint64_t now) {
     Shard& shard = shard_of(ip);
     ShardLock lock(shard.lock);
     Gate& gate = shard.get(ip, policy_);
-    note(gate, outcome, retry_after_ms, now);
+    note(gate, outcome, now);
     const uint64_t start = std::max(gate.next_ms, now);
     gate.next_ms = start + spacing(gate);
+    ++gate.unstarted;  // the caller reports started() when it connects
     return static_cast<uint32_t>(std::min<uint64_t>(start - now, UINT32_MAX));
 }
 
-void IpGates::release(uint32_t ip, Outcome outcome, uint32_t retry_after_ms, uint64_t now, GateEvents& events) {
+void IpGates::started(uint32_t ip, uint64_t now, GateEvents& events) {
+    GateWaiter* woken = nullptr;
+    uint32_t timer = 0;
+    {
+        Shard& shard = shard_of(ip);
+        ShardLock lock(shard.lock);
+        Gate& gate = shard.get(ip, policy_);
+        if (gate.unstarted > 0) {
+            --gate.unstarted;
+        }
+        // The spacing counts from when the connection really started, however
+        // late its owner loop got to it.
+        gate.next_ms = std::max(gate.next_ms, now + spacing(gate));
+        timer = dispatch(gate, now, woken);
+    }
+    deliver(woken, ip, timer, events);
+}
+
+void IpGates::release(uint32_t ip, Outcome outcome, bool unstarted, uint64_t now, GateEvents& events) {
     GateWaiter* woken = nullptr;
     uint32_t timer = 0;
     {
@@ -364,7 +398,10 @@ void IpGates::release(uint32_t ip, Outcome outcome, uint32_t retry_after_ms, uin
         if (gate.active > 0) {
             --gate.active;
         }
-        note(gate, outcome, retry_after_ms, now);
+        if (unstarted && gate.unstarted > 0) {
+            --gate.unstarted;
+        }
+        note(gate, outcome, now);
         timer = dispatch(gate, now, woken);
     }
     deliver(woken, ip, timer, events);

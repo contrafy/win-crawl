@@ -201,6 +201,12 @@ void print_tracking(const HttpServer& http) {
                 ips.size(), static_cast<unsigned long long>(accepts), http.tracked_hosts(), most_open, min_gap, spaced);
     std::printf("  IPs by most connections open at once:");
     for (const auto& [open, count] : by_open) std::printf(" %u:%zu", open, count);
+    std::vector<double> means;
+    for (const IpTrack& t : ips) {
+        if (t.accepts > 1) means.push_back(t.span_ms / static_cast<double>(t.accepts - 1));
+    }
+    std::sort(means.begin(), means.end());
+    if (!means.empty()) std::printf("; median per-IP mean gap %.1f ms", means[means.size() / 2]);
     std::printf("\n");
 }
 

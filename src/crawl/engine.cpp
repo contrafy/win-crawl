@@ -216,7 +216,7 @@ private:
     void resolve(Phase phase, const std::string& host);
     void on_dns(dns::Status status, uint32_t ipv4_be);
     void admit_seed(uint32_t ip);
-    void hold_slot(uint32_t ip);
+    void hold_slot(uint32_t ip, bool start_pending);
     void query_https_rr();
     void on_https_rr(dns::Status status, const dns::HttpsRecord& rr);
     void note_fetch(const FetchResult& result);
@@ -276,9 +276,9 @@ private:
     bool parked_ = false;          // counted as parked by the worker
     bool holding_ = false;         // holds a connection slot at held_ip_
     bool reserved_ = false;        // the next connection start at held_ip_ is already accounted for
+    bool start_pending_ = false;   // ...through a wake or restart(): report started() when connecting
     uint32_t held_ip_ = 0;
     Outcome outcome_ = Outcome::None;  // how the current connection went
-    uint32_t outcome_retry_ms_ = 0;    // its Retry-After, ms
     net::TimerId wait_timer_ = 0;
     uint64_t wait_start_ = 0;
     std::string delay_host_;       // the host whose robots.txt asked for a Crawl-delay
@@ -310,8 +310,8 @@ void Task::reset(std::string_view line) {
     rec_active_ = false;
     holding_ = false;
     reserved_ = false;
+    start_pending_ = false;
     outcome_ = Outcome::None;
-    outcome_retry_ms_ = 0;
     delay_host_.clear();
     delay_ms_ = 0;
     next_request_ms_ = 0;
@@ -376,7 +376,7 @@ void Task::resume(const Waiter& seed) {
         finish();
         return;
     }
-    hold_slot(seed.ip);
+    hold_slot(seed.ip, true);
     w_.stats_.add(Counter::RobotsAttempted);
     query_https_rr();
     start_robots();
@@ -486,16 +486,17 @@ void Task::admit_seed(uint32_t ip) {
         return;
     }
     w_.give_seed(seed);
-    hold_slot(ip);
+    hold_slot(ip, false);
     st.add(Counter::RobotsAttempted);
     query_https_rr();
     start_robots();
 }
 
-void Task::hold_slot(uint32_t ip) {
+void Task::hold_slot(uint32_t ip, bool start_pending) {
     holding_ = true;
     held_ip_ = ip;
     reserved_ = true;  // admission already counted this connection start
+    start_pending_ = start_pending;
 }
 
 void Task::start_robots() {
@@ -574,10 +575,10 @@ void Task::send() {
         // IP): concurrency is unchanged, only the spacing applies.
         if (!reserved_) {
             conn_.close();
-            const uint32_t ms = w_.gates_.restart(ip, outcome_, outcome_retry_ms_, gate_clock_ms());
+            const uint32_t ms = w_.gates_.restart(ip, outcome_, gate_clock_ms());
             outcome_ = Outcome::None;
-            outcome_retry_ms_ = 0;
             reserved_ = true;
+            start_pending_ = true;
             if (ms != 0) {
                 w_.stats_.add(Counter::PoliteWaits);
                 wait(ms, WaitFor::Spacing);
@@ -585,6 +586,10 @@ void Task::send() {
             }
         }
         reserved_ = false;
+        if (start_pending_) {
+            start_pending_ = false;
+            w_.gates_.started(ip, gate_clock_ms(), w_);
+        }
         conn_.fetch(ep, request_, opt_);
         return;
     }
@@ -594,7 +599,7 @@ void Task::send() {
     const Admit admit = w_.gates_.acquire(ip, &wait_, kMaxHopWaiters, gate_clock_ms(), w_);
     switch (admit) {
     case Admit::Now:
-        hold_slot(ip);
+        hold_slot(ip, false);
         reserved_ = false;
         conn_.fetch(ep, request_, opt_);
         return;
@@ -654,7 +659,7 @@ void Task::on_gate(GateWaiter::State state) {
         rec_.wait_ms += waited;
     }
     if (state == GateWaiter::State::Admitted) {
-        hold_slot(wait_.ip);
+        hold_slot(wait_.ip, true);
     }
     if (w_.stopping_) {
         note_aborted();
@@ -693,9 +698,9 @@ void Task::release_slot() {
     }
     holding_ = false;
     reserved_ = false;
-    w_.gates_.release(held_ip_, outcome_, outcome_retry_ms_, gate_clock_ms(), w_);
+    w_.gates_.release(held_ip_, outcome_, start_pending_, gate_clock_ms(), w_);
+    start_pending_ = false;
     outcome_ = Outcome::None;
-    outcome_retry_ms_ = 0;
 }
 
 void Task::note_outcome(const FetchResult& result) {
@@ -703,8 +708,6 @@ void Task::note_outcome(const FetchResult& result) {
         if (throttled(result.status)) {
             w_.stats_.add(Counter::Throttled);
             outcome_ = Outcome::Throttled;
-            const std::optional<uint64_t> s = retry_after_s(*result.reply);
-            outcome_retry_ms_ = s ? static_cast<uint32_t>(std::min<uint64_t>(*s * 1000, UINT32_MAX)) : 0;
         } else if (outcome_ != Outcome::Throttled) {
             outcome_ = Outcome::Replied;
         }
@@ -1407,7 +1410,7 @@ void Worker::arm_gate_timer(uint32_t ip, uint32_t delay_ms) {
 // A new site that waited at a gate ends without a task: the run is stopping.
 void Worker::end_seed(Waiter* waiter) {
     if (waiter->state == GateWaiter::State::Admitted) {
-        gates_.release(waiter->ip, Outcome::None, 0, gate_clock_ms(), *this);
+        gates_.release(waiter->ip, Outcome::None, true, gate_clock_ms(), *this);
     }
     const bool unreachable = waiter->state == GateWaiter::State::Unreachable;
     if (unreachable) {

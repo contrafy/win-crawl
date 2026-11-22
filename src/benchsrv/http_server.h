@@ -65,6 +65,7 @@ struct IpTrack {
     // still open are not counted yet.
     uint32_t max_open = 0;
     double min_gap_ms = -1;   // shortest time between two accepts; -1 with fewer than two
+    double span_ms = 0;       // first to last accept (mean gap: span_ms / (accepts - 1))
 };
 
 // One request as it arrived, with tracking on.

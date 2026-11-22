@@ -47,7 +47,7 @@ struct GatePolicy {
     IpLimits cdn;
     const Ipv4Ranges* cdn_ranges = nullptr;  // IPs in these ranges use `cdn`; null: none do
     uint32_t fail_limit = 5;                 // consecutive failed connections before an IP is unreachable; 0 = never
-    uint32_t max_penalty_ms = 60000;         // cap on the back-off penalty and on a Retry-After push
+    uint32_t max_penalty_ms = 60000;         // cap on the 429/503 back-off penalty
 };
 
 // Monotonic milliseconds for gate decisions (QueryPerformanceCounter).
@@ -102,9 +102,9 @@ enum class Admit : uint8_t {
 // How the connection that is being released (or replaced) went.
 enum class Outcome : uint8_t {
     None,       // nothing conclusive (aborted, TLS failure, reset, local port shortage)
-    Replied,    // the server answered (any status but 429/503)
-    Failed,     // connect failure or timeout without any reply
-    Throttled,  // 429 or 503
+    Replied,    // the server answered (any status but 429/503): relaxes the back-off
+    Failed,     // connect failure or timeout without any reply: counts toward the breaker
+    Throttled,  // 429 or 503: the IP's spacing backs off
 };
 
 struct SeedResult {
@@ -134,12 +134,19 @@ public:
 
     // The holder of a slot at `ip` closed its connection (`outcome`) and opens
     // another one there. Returns how long to wait before connecting; that
-    // start is reserved.
-    uint32_t restart(uint32_t ip, Outcome outcome, uint32_t retry_after_ms, uint64_t now);
+    // start is reserved, and the caller reports started() when it connects.
+    uint32_t restart(uint32_t ip, Outcome outcome, uint64_t now);
+
+    // A slot that came through a wake (Admitted) or restart() connected now.
+    // Until then no other connection starts at the IP while spacing is in
+    // force, and the spacing counts from here: an owner loop that got to its
+    // wake late cannot squeeze the next start closer than the interval.
+    void started(uint32_t ip, uint64_t now, GateEvents& events);
 
     // Gives a connection slot back; `outcome` feeds the back-off and breaker.
-    // `retry_after_ms` (Throttled only) pushes the IP's next start out.
-    void release(uint32_t ip, Outcome outcome, uint32_t retry_after_ms, uint64_t now, GateEvents& events);
+    // `unstarted`: the slot came through a wake or restart() and never
+    // reported started().
+    void release(uint32_t ip, Outcome outcome, bool unstarted, uint64_t now, GateEvents& events);
 
     // Removes a queued waiter. False when it was already woken: its on_wake
     // has been or is being delivered.
@@ -162,10 +169,11 @@ private:
     const IpLimits& limits(const Gate& gate) const;
     bool has_room(const Gate& gate) const;
     uint32_t spacing(const Gate& gate) const;
+    bool start_blocked(const Gate& gate) const;
     void admit(Gate& gate, uint64_t now);
     void enqueue(Gate& gate, GateWaiter* waiter, bool priority);
     void unlink(Gate& gate, GateWaiter* waiter);
-    void note(Gate& gate, Outcome outcome, uint32_t retry_after_ms, uint64_t now);
+    void note(Gate& gate, Outcome outcome, uint64_t now);
     // Pops what the gate can admit now (or everything when it is dead) into
     // the `woken` chain; returns a spacing timer delay to arm, or 0.
     uint32_t dispatch(Gate& gate, uint64_t now, GateWaiter*& woken);

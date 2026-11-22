@@ -146,6 +146,7 @@ public:
         if (s.track.accepts > 0) {
             const double gap = t - s.last_accept;
             if (s.track.min_gap_ms < 0 || gap < s.track.min_gap_ms) s.track.min_gap_ms = gap;
+            s.track.span_ms += gap;
         }
         s.last_accept = t;
         ++s.track.accepts;
