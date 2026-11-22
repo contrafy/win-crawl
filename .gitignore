@@ -16,3 +16,13 @@ CMakeUserPresets.json
 
 # Python bytecode (tools/)
 __pycache__/
+
+# Private keys never go in git (Web Bot Auth: docs/web-bot-auth.md)
+*.jwk
+*.pem
+secrets/
+.dev.vars
+
+# Worker tooling (tools/bot-auth-directory)
+node_modules/
+.wrangler/

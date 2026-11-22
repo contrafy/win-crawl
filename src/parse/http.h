@@ -36,10 +36,11 @@
 namespace wc::parse {
 
 // Appends "METHOD target HTTP/1.1" plus Host, User-Agent (omitted when empty),
-// Accept: */* and Connection headers. No Accept-Encoding, so servers reply
-// with identity bodies.
+// Accept: */* and Connection headers, then `extra_headers` verbatim: whole
+// header lines, each ending in CRLF (the Web Bot Auth signature fields). No
+// Accept-Encoding, so servers reply with identity bodies.
 void append_request(std::string& out, std::string_view method, const Url& url,
-                    std::string_view user_agent, bool keep_alive);
+                    std::string_view user_agent, bool keep_alive, std::string_view extra_headers = {});
 
 enum class ParseStatus : uint8_t { NeedMore, Done, Error };
 

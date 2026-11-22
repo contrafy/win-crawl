@@ -1,10 +1,12 @@
 #include "crawl/engine.h"
 
 #include "crawl/tests/fake_servers.h"
+#include "sig/jwk.h"
 #include "doctest/doctest.h"
 
 #include <windows.h>
 
+#include <algorithm>
 #include <chrono>
 #include <fstream>
 #include <map>
@@ -49,6 +51,23 @@ std::string url(const char* host, uint16_t port, const char* path = "/") {
 }
 
 const char* kHtml = "Content-Type: text/html\r\n";
+
+// Web Bot Auth: a fresh key signs every request and the fake server checks
+// each signature with the wc::sig verifier.
+void sign_requests(Config& cfg, FakeHttp& http) {
+    REQUIRE(cfg.bot_auth_key.generate());
+    cfg.signature_agent = "https://bot-auth.example";
+    std::vector<wc::sig::PublicJwk> keys(1);
+    std::copy(cfg.bot_auth_key.public_key(), cfg.bot_auth_key.public_key() + 32, keys[0].x.begin());
+    keys[0].thumbprint = wc::sig::thumbprint(keys[0].x.data());
+    http.verify_signatures(std::move(keys));
+}
+
+void check_all_signed(const FakeHttp& http) {
+    CHECK(http.total_requests() > 0);
+    CHECK_MESSAGE(http.signatures_invalid() == 0, http.first_signature_error());
+    CHECK(http.signatures_valid() == http.total_requests());
+}
 
 }  // namespace
 
@@ -160,10 +179,12 @@ TEST_CASE("engine: classic --no-keepalive uses one connection per request") {
 
     Config cfg = base_config(dns_port);
     cfg.keepalive = false;
+    sign_requests(cfg, http);  // HTTP/1.0 requests carry the signature too
     const Snapshot s = crawl(cfg, url("a.test", port, "/p"));
     CHECK(s[Counter::PagesOk] == 1);
     CHECK(s[Counter::Links] == 1);
     CHECK(http.accepts(loopback_ip(41)) == 2);
+    check_all_signed(http);
 }
 
 TEST_CASE("engine: real mode follows redirects and honours robots.txt") {
@@ -209,6 +230,7 @@ TEST_CASE("engine: real mode follows redirects and honours robots.txt") {
     Config cfg = base_config(dns_port);
     cfg.mode = Mode::Real;
     cfg.robots_limit = kRealRobotsLimit;
+    sign_requests(cfg, http);  // every hop, including the cross-host redirect, is signed for its own authority
     const Snapshot s = crawl(cfg, urls);
     CHECK(s[Counter::UrlsRead] == 5);
     CHECK(s[Counter::UrlsParsed] == 5);
@@ -232,6 +254,30 @@ TEST_CASE("engine: real mode follows redirects and honours robots.txt") {
     CHECK(http.requests("r5.test", "/") == 0);
     CHECK(http.requests("r6.test", "/robots-real.txt") == 1);
     CHECK(http.requests("r6.test", "/") == 1);
+    check_all_signed(http);
+}
+
+TEST_CASE("engine: Web Bot Auth signs every keep-alive request") {
+    ServerThread srv;
+    FakeDns dns(srv);
+    FakeHttp http(srv);
+    const uint16_t pa = http.listen(loopback_ip(51));
+    const uint16_t pb = http.listen(loopback_ip(52));
+    dns.add("a.test", loopback_ip(51));
+    dns.add("b.test", loopback_ip(52));
+    const uint16_t dns_port = dns.start();
+    http.route("a.test", "/robots.txt", Route{reply(404, "")});
+    http.route("a.test", "/p", Route{reply(200, "<a href=/1>1</a>", kHtml)});
+    http.route("b.test", "/robots.txt", Route{reply(404, "")});
+    http.route("b.test", "/", Route{reply(200, "x")});
+
+    Config cfg = base_config(dns_port);
+    sign_requests(cfg, http);
+    const Snapshot s = crawl(cfg, url("a.test", pa, "/p") + url("B.Test", pb));
+    CHECK(s[Counter::PagesOk] == 2);
+    CHECK(http.accepts(loopback_ip(51)) == 1);  // robots + page on one connection, each signed
+    CHECK(http.total_requests() == 4);
+    check_all_signed(http);
 }
 
 TEST_CASE("engine: request_stop aborts in-flight work promptly") {

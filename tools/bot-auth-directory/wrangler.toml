@@ -1,0 +1,25 @@
+# wincrawl Web Bot Auth key directory. Deploy steps: README.md.
+name = "bot-auth-directory"
+main = "src/index.js"
+compatibility_date = "2026-11-01"
+
+# Served at https://bot-auth-directory.<your-subdomain>.workers.dev by default,
+# which is a valid Signature-Agent origin on its own (Cloudflare Radar's URL
+# Scanner uses a workers.dev directory).
+workers_dev = true
+
+# Or on a hostname of a zone in your account. The directory must sit at that
+# host's /.well-known/http-message-signatures-directory, so give it a host of
+# its own. Replace the placeholder and uncomment:
+# routes = [
+#   { pattern = "bot.example.com", custom_domain = true },
+# ]
+
+[vars]
+# Seconds each directory response signature stays valid; also its max-age.
+SIGNATURE_TTL = "300"
+
+# Secret, never in this file: BOT_AUTH_PRIVATE_JWK, the private JWK written by
+# `wincrawl-botauth keygen` (or {"keys":[...]} of several, while rotating):
+#   npx wrangler secret put BOT_AUTH_PRIVATE_JWK < secrets/bot-auth.jwk
+# For `wrangler dev`, put it in .dev.vars (gitignored) instead.

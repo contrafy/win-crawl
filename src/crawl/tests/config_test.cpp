@@ -261,3 +261,19 @@ TEST_CASE("config: errors") {
     CHECK(fails({"-qq", "a.txt"}, "unknown option -qq"));
     CHECK(fails({"--json=", "a.txt"}, "--json"));
 }
+
+TEST_CASE("config: Web Bot Auth options") {
+    Config cfg;
+    REQUIRE(parse({"--bot-auth-key", "k.jwk", "--signature-agent", "https://bot.example", "a.txt"}, cfg).status ==
+            ParseStatus::Ok);
+    CHECK(cfg.bot_auth_key_path == "k.jwk");
+    CHECK(cfg.signature_agent == "https://bot.example");
+    CHECK_FALSE(cfg.bot_auth_key.valid());  // main() loads the file
+    REQUIRE(parse({"a.txt"}, cfg).status == ParseStatus::Ok);
+    CHECK(cfg.bot_auth_key_path.empty());
+    CHECK(fails({"--bot-auth-key", "k.jwk", "a.txt"}, "go together"));
+    CHECK(fails({"--signature-agent", "https://bot.example", "a.txt"}, "go together"));
+    CHECK(fails({"--bot-auth-key", "k.jwk", "--signature-agent", "http://bot.example", "a.txt"}, "https://"));
+    CHECK(fails({"--bot-auth-key", "k.jwk", "--signature-agent", "https://", "a.txt"}, "--signature-agent"));
+    CHECK(usage_text().find("--bot-auth-key FILE") != std::string::npos);
+}

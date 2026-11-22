@@ -62,7 +62,7 @@ int hex_value(char c) {
 }  // namespace
 
 void append_request(std::string& out, std::string_view method, const Url& url,
-                    std::string_view user_agent, bool keep_alive) {
+                    std::string_view user_agent, bool keep_alive, std::string_view extra_headers) {
     out.append(method);
     out.push_back(' ');
     out.append(url.target);
@@ -74,7 +74,9 @@ void append_request(std::string& out, std::string_view method, const Url& url,
     }
     out.append("\r\nAccept: */*\r\nConnection: ");
     out.append(keep_alive ? "keep-alive" : "close");
-    out.append("\r\n\r\n");
+    out.append("\r\n");
+    out.append(extra_headers);
+    out.append("\r\n");
 }
 
 const char* to_string(HttpError error) {

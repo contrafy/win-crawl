@@ -19,6 +19,7 @@ between two independent codecs), so logic bugs crash too.
 | `links` | `parse::LinkExtractor` | Optional first line is the page URL. Count-only and collecting extraction return the same count, equal to the number of URLs collected; a fresh and a warm (reused across inputs) extractor agree in both modes; `extract()` clears its output vector; every collected URL is well formed and `to_string()` of it re-parses to the same Url. The document is an exact-size heap copy so over-reads are caught. |
 | `benchsrv_dns` | `benchsrv::build_dns_reply` (the fake DNS server's own query codec) | Drop exactly for datagrams shorter than a header or with QR set, and then no reply bytes; otherwise a reply ≥ 12 and ≤ 512 bytes echoing the id with QR set; non-error replies carry the question verbatim; Answered replies parse with `wc::dns` (cross-codec check; skipped when a label contains `.`, which `wc::dns` rejects by design) to exactly one A record equal to `host_ip()` for the `h<N>` name. |
 | `record` | `crawl::append_json_string`, `truncate_utf8`, `alt_svc_has_h3`, `parse_hsts` (study record) | `append_json_string` appends exactly one string literal accepted by a strict RFC 8259 validator, in valid UTF-8 (no overlongs, surrogates, > U+10FFFF), keeping what was in the buffer, and decoding back to the input when the input was valid UTF-8. `truncate_utf8` returns a prefix ≤ max that, for valid input, is valid UTF-8 and at most 3 bytes short of max. `alt_svc_has_h3` is false without `h3` in the value, true once an h3 alternative is prepended, unaffected by leading OWS. A valid `parse_hsts` result survives a round trip through its canonical serialization; directive names are case-insensitive. |
+| `sig` | `sig::sfv` parsers, `parse_jwk`/`parse_key_set`/`parse_private_key`, `parse_http_message`, `verify_signatures`, `verify_directory`, `RequestSigner` (Web Bot Auth) | Byte 0 picks a mode. SFV: a parsed Dictionary or Item serializes, reparses to an equal value, and is a fixed point of serialization; each member value serialized alone reparses to the same member. JWK: every key found has a 43-character thumbprint equal to `thumbprint(x)`, and its canonical public JWK (and private JWK, when `d` loaded) parses back to the same key; `find_key` finds it. Verify: message text checked under the RFC 9421, Web Bot Auth and directory profiles against the RFC 9421 test key gives deterministic results; the overall result is valid exactly when every signature is; a valid signature names a known key and was checked over a base ending in its `@signature-params` line; a valid directory has every key proven. Sign: whatever authority, `Signature-Agent`, label, form, window and nonce `RequestSigner` accepts verifies under the Web Bot Auth profile with the same label, nonce and agent, and fails for another authority. |
 
 Each target has a seed corpus in `fuzz/corpus/<target>/` (hand-written
 examples of normal and edge-case inputs, a few files each; `fuzz/.gitattributes`
@@ -133,6 +134,13 @@ target runs a reference matcher over up to 16 rules × 34 targets twice per
 input; `http_response` parses every input twice and copies the buffer at
 each split) on a shared machine, so they are lower bounds. The unit tests
 also all pass under ASan (`ctest --preset fuzz`).
+
+`sig` (added 2026-11-22 with Web Bot Auth, [`web-bot-auth.md`](web-bot-auth.md)):
+3 min from the seed corpus, then 10 min continuing from that work corpus,
+same machine and settings. 12.3 M executions in total; the 10-minute run
+averaged 13,660 exec/s and ended at cov 2,694, ft 10,498, corpus 2,382. No
+findings. The sign mode runs an Ed25519 signature and verification per input,
+which bounds its speed.
 
 The first CI run of the job (60 s per target, 4-vCPU windows-latest runner)
 saw 53–110 k exec/s for the DNS targets, 14–16 k for `http_response`, `url`

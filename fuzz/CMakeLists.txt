@@ -30,6 +30,7 @@ wc_add_fuzzer(url LIBS wc_parse)
 wc_add_fuzzer(robots LIBS wc_parse)
 wc_add_fuzzer(links LIBS wc_parse)
 wc_add_fuzzer(benchsrv_dns LIBS wc_benchsrv wc_dns)
+wc_add_fuzzer(sig LIBS wc_sig)
 
 get_property(wc_fuzzers GLOBAL PROPERTY WC_FUZZERS)
 add_custom_target(fuzzers DEPENDS ${wc_fuzzers})

@@ -1,0 +1,15 @@
+{
+  "name": "bot-auth-directory",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cloudflare Worker serving wincrawl's Web Bot Auth key directory (/.well-known/http-message-signatures-directory)",
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "4.166.0"
+  }
+}
