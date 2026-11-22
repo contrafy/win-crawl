@@ -12,6 +12,7 @@ add_library(wc_crawl STATIC
   engine.cpp
   input.cpp
   ipranges.cpp
+  politeness.cpp
   record.cpp
   stats.cpp
   ${CMAKE_CURRENT_BINARY_DIR}/cloudflare_data.cpp)
@@ -22,6 +23,7 @@ wc_add_test(crawl_tests
     tests/config_test.cpp
     tests/dedupe_test.cpp
     tests/input_test.cpp
+    tests/politeness_test.cpp
     tests/record_test.cpp
     tests/stats_test.cpp
   LIBS wc_crawl)
@@ -33,3 +35,10 @@ wc_add_test(crawl_e2e_tests
     tests/connection_test.cpp
     tests/engine_test.cpp
   LIBS wc_crawl)
+
+# Politeness end-to-end: the engine against the benchmark rig's servers, which
+# record per-IP concurrency and per-host request times (docs/politeness.md).
+wc_add_test(crawl_polite_tests
+  SOURCES
+    tests/polite_test.cpp
+  LIBS wc_crawl wc_benchsrv)

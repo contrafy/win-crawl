@@ -70,8 +70,7 @@ void Connection::fetch(const Endpoint& endpoint, std::string_view request, const
         fail(FetchError::Timeout);
     });
 
-    const bool same = keep_open_ && ip_ == endpoint.ipv4_be && port_ == endpoint.port && is_tls_ == endpoint.tls &&
-                      server_name_ == endpoint.server_name;
+    const bool same = reuses(endpoint);
     keep_open_ = false;
     if (same) {
         reused_ = true;

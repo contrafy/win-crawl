@@ -1,5 +1,6 @@
 #include "crawl/config.h"
 
+#include "crawl/ipranges.h"
 #include "doctest/doctest.h"
 
 #include <initializer_list>
@@ -55,6 +56,17 @@ TEST_CASE("config: defaults") {
     CHECK(cfg.dns_attempts == 3);
     CHECK(cfg.json_path.empty());
     CHECK_FALSE(cfg.quiet);
+    // Politeness: the assignment's IP dedupe, polite limits per IP.
+    CHECK(cfg.hosts_per_ip == 1);
+    CHECK(cfg.ip_concurrency == 2);
+    CHECK(cfg.ip_interval_ms == 250);
+    CHECK(cfg.max_crawl_delay_s == 30);
+    CHECK(cfg.max_retry_after_s == 30);
+    CHECK(cfg.ip_fail_limit == 5);
+    CHECK(cfg.cdn_policy);
+    CHECK_FALSE(cfg.cdn_hosts_per_ip.has_value());
+    CHECK(cfg.cdn_ip_concurrency == 16);
+    CHECK(cfg.cdn_ip_interval_ms == 0);
 
     Config real;
     REQUIRE(parse({"--mode", "real", "urls.txt"}, real).status == ParseStatus::Ok);
@@ -129,6 +141,59 @@ TEST_CASE("config: every option, both spellings") {
     CHECK(c2.input_path == "-weird-name.txt");
 }
 
+TEST_CASE("config: politeness options and the gate policy they make") {
+    Config def;
+    REQUIRE(parse({"u.txt"}, def).status == ParseStatus::Ok);
+    GatePolicy p = gate_policy(def);
+    CHECK(p.ip.hosts == 1);
+    CHECK(p.ip.concurrency == 2);
+    CHECK(p.ip.interval_ms == 250);
+    CHECK(p.ip.backoff);
+    CHECK(p.cdn.hosts == 1);  // the default IP dedupe covers CDN IPs too
+    CHECK(p.cdn.concurrency == 16);
+    CHECK(p.cdn.interval_ms == 0);
+    CHECK_FALSE(p.cdn.backoff);
+    CHECK(p.cdn_ranges == &cloudflare_ipv4());
+    CHECK(p.fail_limit == 5);
+
+    Config all;
+    REQUIRE(parse({"--hosts-per-ip", "50", "--ip-concurrency=3", "--ip-interval", "400", "--max-crawl-delay", "10",
+                   "--max-retry-after=5", "--ip-fail-limit", "0", "--cdn-ip-concurrency", "8", "--cdn-ip-interval",
+                   "20", "u.txt"},
+                  all)
+                .status == ParseStatus::Ok);
+    CHECK(all.hosts_per_ip == 50);
+    CHECK(all.ip_concurrency == 3);
+    CHECK(all.ip_interval_ms == 400);
+    CHECK(all.max_crawl_delay_s == 10);
+    CHECK(all.max_retry_after_s == 5);
+    CHECK(all.ip_fail_limit == 0);
+    p = gate_policy(all);
+    CHECK(p.cdn.hosts == 0);  // lifting the budget lifts it entirely on CDN edges
+    CHECK(p.cdn.concurrency == 8);
+    CHECK(p.cdn.interval_ms == 20);
+    CHECK(p.fail_limit == 0);
+
+    Config nodedupe;
+    REQUIRE(parse({"--no-ip-dedupe", "--cdn-hosts-per-ip", "7", "--no-cdn-policy", "u.txt"}, nodedupe).status ==
+            ParseStatus::Ok);
+    CHECK(nodedupe.hosts_per_ip == 0);
+    p = gate_policy(nodedupe);
+    CHECK(p.ip.hosts == 0);
+    CHECK(p.cdn.hosts == 7);
+    CHECK(p.cdn_ranges == nullptr);
+
+    Ipv4Ranges mine;
+    Config injected;
+    injected.cdn_ranges = &mine;
+    CHECK(gate_policy(injected).cdn_ranges == &mine);
+
+    CHECK(fails({"--hosts-per-ip", "-1", "u.txt"}, "--hosts-per-ip"));
+    CHECK(fails({"--ip-interval", "1s", "u.txt"}, "--ip-interval"));
+    CHECK(fails({"--max-crawl-delay", "3601", "u.txt"}, "--max-crawl-delay"));
+    CHECK(fails({"--no-ip-dedupe=1", "u.txt"}, "takes no value"));
+}
+
 TEST_CASE("config: threads are capped by concurrency") {
     Config cfg;
     REQUIRE(parse({"-t", "16", "-c", "3", "u.txt"}, cfg).status == ParseStatus::Ok);
@@ -162,7 +227,9 @@ TEST_CASE("config: help") {
     for (const char* opt : {"--mode", "--threads", "--concurrency", "--dns", "--dns-inflight", "--dns-timeout",
                             "--dns-attempts", "--connect-timeout", "--timeout", "--robots-limit", "--page-limit",
                             "--no-keepalive", "--insecure", "--max-redirects", "--stats-interval", "--json",
-                            "--quiet", "--help"}) {
+                            "--quiet", "--help", "--hosts-per-ip", "--no-ip-dedupe", "--ip-concurrency",
+                            "--ip-interval", "--max-crawl-delay", "--max-retry-after", "--ip-fail-limit",
+                            "--cdn-hosts-per-ip", "--cdn-ip-concurrency", "--cdn-ip-interval", "--no-cdn-policy"}) {
         CHECK_MESSAGE(text.find(opt) != std::string::npos, opt);
     }
 }

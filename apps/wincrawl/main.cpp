@@ -51,6 +51,32 @@ bool write_file(const std::string& path, const std::string& text) {
     return std::fclose(f) == 0 && ok;
 }
 
+std::string limit(uint32_t v, const char* unit) {
+    return v == 0 ? "unlimited " + std::string(unit) : std::to_string(v) + " " + unit;
+}
+
+// What --hosts-per-ip and friends resolved to, per IP class.
+void print_politeness(const Config& cfg) {
+    const GatePolicy p = gate_policy(cfg);
+    std::printf("Politeness: %s, %s per IP, %u ms apart", limit(p.ip.hosts, "hosts").c_str(),
+                limit(p.ip.concurrency, "connections").c_str(), p.ip.interval_ms);
+    if (p.cdn_ranges != nullptr) {
+        std::printf("; Cloudflare IPs: %s, %s, %u ms apart", limit(p.cdn.hosts, "hosts").c_str(),
+                    limit(p.cdn.concurrency, "connections").c_str(), p.cdn.interval_ms);
+    }
+    std::printf("\n            ");
+    if (p.fail_limit != 0) {
+        std::printf("IPs skipped after %u failed connections in a row", p.fail_limit);
+    } else {
+        std::printf("IPs never skipped for failing");
+    }
+    if (cfg.mode == Mode::Real) {
+        std::printf("; Crawl-delay honoured up to %u s, Retry-After up to %u s", cfg.max_crawl_delay_s,
+                    cfg.max_retry_after_s);
+    }
+    std::printf("\n");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -82,6 +108,7 @@ int main(int argc, char** argv) {
     }
     std::printf("DNS %s, %u in flight, %u ms x %u attempts\n", dns.c_str(), cfg.dns_inflight, cfg.dns_timeout_ms,
                 cfg.dns_attempts);
+    print_politeness(cfg);
     if (cfg.mode == Mode::Real) {
         // Started here (the engine's later call is a no-op) so the header can
         // say what the ClientHello really offers: Schannel enables

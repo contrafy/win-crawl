@@ -257,3 +257,117 @@ TEST_CASE("response delay is applied") {
     CHECK(ms >= 120 - 16);
     CHECK(ms < 2000);
 }
+
+namespace {
+
+// Waits until the server has seen every connection closed.
+void wait_closed(const HttpServer& server) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (server.counters().active != 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+const IpTrack* find_track(const std::vector<IpTrack>& tracks, uint32_t ip_be) {
+    for (const IpTrack& t : tracks) {
+        if (t.ip == ip_be) return &t;
+    }
+    return nullptr;
+}
+
+}  // namespace
+
+TEST_CASE("tracking: per-IP concurrency, accept gaps and the request log on two addresses") {
+    HttpServerConfig cfg;
+    cfg.threads = 2;
+    cfg.track = true;
+    Behavior b = Fixture::make_behavior();
+    HttpServer server(b, cfg);
+    wc::net::startup();
+    sockaddr_in a1 = loopback(0);
+    sockaddr_in a2 = a1;
+    a2.sin_addr.s_addr = htonl(0x7F000002);
+    REQUIRE(server.start(std::vector<sockaddr_in>{a1, a2}) == 0);  // port 0 twice: one shared port
+    a1.sin_port = a2.sin_port = server.local_address().sin_port;
+    {
+        // x answers once, then y opens and answers, then x answers again: by
+        // the server's own clock x (accept .. last response) spans y.
+        RawSocket x = tcp_connect(a1);
+        HttpReader rx(x.get());
+        REQUIRE(send_all(x.get(), get("/robots.txt", 7)));
+        REQUIRE(rx.read().ok);
+        RawSocket y = tcp_connect(a1);
+        HttpReader ry(y.get());
+        REQUIRE(send_all(y.get(), get("/p/1", 7)));
+        REQUIRE(ry.read().ok);
+        REQUIRE(send_all(x.get(), get("/p/2", 7)));
+        REQUIRE(rx.read().ok);
+    }
+    {
+        RawSocket z = tcp_connect(a2);
+        HttpReader rz(z.get());
+        REQUIRE(send_all(z.get(), get("/p/1", 8)));
+        REQUIRE(rz.read().ok);
+    }
+    wait_closed(server);
+    const std::vector<IpTrack> tracks = server.ip_tracks();
+    REQUIRE(tracks.size() == 2);
+    const IpTrack* one = find_track(tracks, htonl(0x7F000001));
+    const IpTrack* two = find_track(tracks, htonl(0x7F000002));
+    REQUIRE(one != nullptr);
+    REQUIRE(two != nullptr);
+    CHECK(one->accepts == 2);
+    CHECK(one->max_open == 2);
+    CHECK(one->min_gap_ms >= 0);
+    CHECK(two->accepts == 1);
+    CHECK(two->max_open == 1);
+    CHECK(two->min_gap_ms == -1);
+    const std::vector<RequestEvent> log = server.host_requests(7);
+    REQUIRE(log.size() == 3);
+    CHECK(log[0].robots);
+    CHECK_FALSE(log[1].robots);
+    CHECK(log[0].t_ms <= log[1].t_ms);
+    CHECK(log[1].t_ms <= log[2].t_ms);
+    CHECK(server.host_requests(8).size() == 1);
+    CHECK(server.host_requests(9).empty());
+    CHECK(server.tracked_hosts() == 2);
+}
+
+TEST_CASE("tracking is off by default") {
+    Fixture f;
+    RawSocket s = tcp_connect(f.addr);
+    HttpReader reader(s.get());
+    REQUIRE(send_all(s.get(), get("/robots.txt", 3)));
+    REQUIRE(reader.read().ok);
+    CHECK(f.server.ip_tracks().empty());
+    CHECK(f.server.tracked_hosts() == 0);
+}
+
+TEST_CASE("Crawl-delay robots and throttled first page requests") {
+    Behavior b = Fixture::make_behavior();
+    b.robots_404 = 0;
+    b.crawl_delay = 1;
+    b.crawl_delay_s = 3;
+    b.throttle = 1;
+    b.retry_after_s = 7;
+    b.redirect = b.not_found = b.server_error = 0;
+    HttpServer server(b, HttpServerConfig{});
+    wc::net::startup();
+    REQUIRE(server.start(loopback(0)) == 0);
+    RawSocket s = tcp_connect(server.local_address());
+    HttpReader reader(s.get());
+    REQUIRE(send_all(s.get(), get("/robots.txt", 4)));
+    HttpReply robots = reader.read();
+    REQUIRE(robots.ok);
+    CHECK(robots.status == 200);
+    CHECK(robots.body.find("Crawl-delay: 3\n") != std::string::npos);
+    for (uint64_t host : {4, 5}) {
+        REQUIRE(send_all(s.get(), get("/p/1", host)));
+        HttpReply first = reader.read();
+        REQUIRE(first.ok);
+        CHECK(first.status == 429);
+        CHECK(first.header("Retry-After") == "7");
+        REQUIRE(send_all(s.get(), get("/p/1", host)));
+        CHECK(reader.read().status == 200);
+    }
+}

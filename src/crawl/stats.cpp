@@ -17,7 +17,10 @@ constexpr const char* kCounterNames[kCounterCount] = {
     "links",           "bytes_received",     "connect_fail",     "timeouts",    "tls_fail",
     "tls_cert_fail",   "port_exhaustion",    "other_fail",       "redirects_followed", "dns_queries_sent",
     "dns_retries",     "dns_timeouts",
-    "inflight",
+    "ip_extra_hosts",  "ip_budget_skips",    "ip_unreachable",   "ip_busy",     "cdn_hosts",
+    "polite_waits",    "polite_wait_ms",     "crawl_delay_waits", "crawl_delay_ms", "crawl_delay_skips",
+    "throttled",       "retry_after_retries",
+    "inflight",        "polite_waiting",
 };
 
 void appendf(std::string& out, const char* fmt, ...) {
@@ -72,9 +75,12 @@ std::string format_status(const Snapshot& s, double elapsed_s, uint64_t queued) 
     return out;
 }
 
-std::string format_rate(double pps, double mbps) {
+std::string format_rate(double pps, double mbps, uint64_t waiting) {
     std::string out;
     appendf(out, "      *** crawling %.1f pps @ %.1f Mbps", pps, mbps);
+    if (waiting != 0) {
+        appendf(out, ", %llu waiting on politeness", static_cast<unsigned long long>(waiting));
+    }
     return out;
 }
 
@@ -109,6 +115,14 @@ std::string format_summary(const Snapshot& s, const RunInfo& info) {
     appendf(out, "Other fetch failures (reset, bad reply, too large) %llu, port exhaustion retries %llu\n",
             u(s[Counter::OtherFail]), u(s[Counter::PortExhaustion]));
     appendf(out, "Peak in-flight %llu\n", u(info.peak_inflight));
+    appendf(out,
+            "Politeness: %llu hosts beyond the first per IP, %llu skipped by the per-IP budget, %llu on unreachable "
+            "IPs, %llu redirects refused (busy or unreachable IP); %llu waits (%.1f s)\n",
+            u(s[Counter::IpExtraHosts]), u(s[Counter::IpBudgetSkips]), u(s[Counter::IpUnreachable]),
+            u(s[Counter::IpBusy]), u(s[Counter::PoliteWaits]), static_cast<double>(s[Counter::PoliteWaitMs]) / 1000.0);
+    appendf(out, "Crawl-delay: %llu waits (%.1f s), %llu pages skipped; 429/503 replies %llu, Retry-After retries %llu\n",
+            u(s[Counter::CrawlDelayWaits]), static_cast<double>(s[Counter::CrawlDelayMs]) / 1000.0,
+            u(s[Counter::CrawlDelaySkips]), u(s[Counter::Throttled]), u(s[Counter::RetryAfterRetries]));
     if (info.pq_requested) {
         appendf(out, "Post-quantum key exchange: %s, %s\n", *info.pq_requested ? "requested" : "disabled (--no-pq)",
                 info.pq_offered.value_or(false) ? "offered in the ClientHello" : "not offered in the ClientHello");
@@ -122,8 +136,8 @@ std::string format_json(const Snapshot& s, const RunInfo& info) {
     appendf(out, "\"mode\":\"%s\",\"threads\":%u,\"concurrency\":%u,\"elapsed_s\":%.3f", info.mode.c_str(), info.threads,
             info.concurrency, info.elapsed_s);
     for (size_t i = 0; i < kCounterCount; ++i) {
-        if (static_cast<Counter>(i) == Counter::Inflight) {
-            continue;  // a gauge; the schema carries peak_inflight instead
+        if (is_gauge(static_cast<Counter>(i))) {
+            continue;  // the schema carries peak_inflight instead
         }
         appendf(out, ",\"%s\":%llu", kCounterNames[i], static_cast<unsigned long long>(s.values[i]));
     }
@@ -210,7 +224,8 @@ void Reporter::run() {
         const double mbps = static_cast<double>(bytes - last_bytes) * 8.0 / 1e6 / dt;
         const uint64_t taken = s[Counter::UrlsRead];
         const uint64_t queued = taken < total_urls_ ? total_urls_ - taken : 0;
-        const std::string line = format_status(s, now, queued) + "\n" + format_rate(pps, mbps) + "\n";
+        const std::string line =
+            format_status(s, now, queued) + "\n" + format_rate(pps, mbps, s[Counter::PoliteWaiting]) + "\n";
         std::fwrite(line.data(), 1, line.size(), out_);
         std::fflush(out_);
         last_print = now;

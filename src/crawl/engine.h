@@ -1,15 +1,17 @@
 #pragma once
 // The crawl engine: N share-nothing IOCP event loops on N threads.
 //
-// Each loop owns a DNS resolver, a fixed pool of task slots (one URL task and
-// one Connection per slot), a link extractor and its own stats block. Loops
-// pull URLs from the shared UrlInput in batches and share only the global
-// HostSet/IpSet. A loop stops once the input is exhausted and it has no live
-// tasks; run() returns once every loop stopped.
+// Each loop owns a DNS resolver, a pool of task slots (one URL task and one
+// Connection per slot), a link extractor and its own stats block. Loops pull
+// URLs from the shared UrlInput in batches and share only the global HostSet
+// and the per-IP politeness gates (politeness.h). A loop stops once the input
+// is exhausted and it has no live tasks and no politeness waits; run()
+// returns once every loop stopped.
 
 #include "crawl/config.h"
 #include "crawl/dedupe.h"
 #include "crawl/input.h"
+#include "crawl/politeness.h"
 #include "crawl/record.h"
 #include "crawl/stats.h"
 
@@ -58,7 +60,7 @@ private:
     UrlInput& input_;
     Stats& stats_;
     HostSet hosts_;
-    IpSet ips_;
+    IpGates gates_;
     RecordWriter records_;
     std::atomic<uint64_t> records_written_{0};
     std::atomic<bool> stop_{false};

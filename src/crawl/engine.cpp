@@ -13,6 +13,9 @@
 #include "tls/tls.h"
 
 #include <algorithm>
+#include <cmath>
+#include <ctime>
+#include <deque>
 #include <memory>
 #include <thread>
 
@@ -33,6 +36,11 @@ constexpr uint32_t kPortRetryMaxMs = 1000;
 // this much (~500 records), i.e. one lock round trip per few hundred sites.
 constexpr size_t kRecordFlush = 256 * 1024;
 constexpr size_t kRecordBuffer = kRecordFlush + 64 * 1024;  // a record rarely exceeds 1 KiB
+// A redirect to another IP queues behind at most this many other sites under
+// way there; past that the hop is given up ("ip_busy"). Thousands of parked
+// domains redirecting to one landing host must not pile up behind that one
+// IP's spacing.
+constexpr uint32_t kMaxHopWaiters = 64;
 
 bool ascii_iprefix(std::string_view text, std::string_view prefix) {
     if (text.size() < prefix.size()) {
@@ -67,13 +75,40 @@ bool same_origin(const parse::Url& a, const parse::Url& b) {
     return a.scheme == b.scheme && a.port == b.port && a.host == b.host;
 }
 
+bool throttled(int status) {
+    return status == 429 || status == 503;
+}
+
+// Retry-After of a reply, in seconds; nullopt when absent or malformed.
+std::optional<uint64_t> retry_after_s(const parse::ResponseParser& reply) {
+    if (!reply.has_header("Retry-After")) {
+        return std::nullopt;
+    }
+    return parse_retry_after(reply.header("Retry-After"), static_cast<int64_t>(std::time(nullptr)));
+}
+
 }  // namespace
 
 class Task;
+class Worker;
+
+// A wait at an IP gate. Every task embeds one for its own waits; new sites
+// that queue before holding a task use one from their loop's pool, so a
+// backlog of thousands of hosts on one IP costs a few dozen bytes per host,
+// not a task slot.
+struct Waiter : GateWaiter {
+    Worker* owner = nullptr;
+    Task* task = nullptr;     // a parked task; null for a queued new site
+    std::string_view line;    // new site: its input line (lives in the input)
+    uint64_t start_ms = 0;    // new site: when its URL was claimed (loop clock)
+    uint64_t queued_ms = 0;   // new site: when it started waiting (loop clock)
+    bool in_use = false;      // new site: taken from the pool
+};
 
 // Everything one event loop owns. Constructed, run and destroyed on its own
-// thread; only request_stop() is reached from elsewhere, through post().
-class Worker {
+// thread; other loops reach it only through post() (request_stop(), and
+// waiters woken at a gate by another loop).
+class Worker final : public GateEvents {
 public:
     Worker(Engine& engine, size_t index, unsigned slots, unsigned dns_inflight,
            const std::vector<sockaddr_in>& dns_servers);
@@ -90,64 +125,108 @@ public:
     net::Loop loop_;
     dns::Resolver resolver_;
     parse::LinkExtractor links_;
+    IpGates& gates_;
     bool stopping_ = false;
     const bool recording_;  // --record
 
     void task_done(Task* task);
     bool new_host(std::string_view host) { return engine_.hosts_.insert(host); }
-    bool new_ip(uint32_t ipv4_be) { return engine_.ips_.insert(ipv4_be); }
     void emit(const SiteRecord& record);
+
+    // Politeness bookkeeping. A parked task waits on politeness without a
+    // socket; up to `slots` of them do not count against the loop's slots,
+    // so a busy IP cannot starve the loop of work.
+    Waiter* take_seed();
+    void give_seed(Waiter* waiter);
+    void seed_queued();
+    void park(bool& counted);
+    void unpark(bool& counted);
+
+    // GateEvents, called on this loop's thread for decisions it made.
+    void on_wake(GateWaiter* waiter) override;
+    void arm_gate_timer(uint32_t ip, uint32_t delay_ms) override;
 
 private:
     void start();
     void arm_dns_timer();
+    void kick();
     void pump();
     bool next_url(std::string_view& out);
+    Task* take_task(bool admitted_seed);
+    void end_seed(Waiter* waiter);
+    size_t live() const { return running_ + parked_ + queued_seeds_; }
+    void update_gauges();
     void maybe_finish();
     void sync_dns_counters();
     void drain();
 
+    const unsigned slots_;
     std::vector<std::unique_ptr<Task>> tasks_;
     std::vector<Task*> free_;
     std::vector<std::string_view> batch_;
     size_t batch_pos_ = 0;
-    size_t live_ = 0;
+    size_t running_ = 0;        // tasks at work
+    size_t parked_ = 0;         // tasks waiting on politeness outside the slot count (<= slots_)
+    size_t waiting_tasks_ = 0;  // every task waiting on politeness
+    size_t queued_seeds_ = 0;   // new sites waiting at a gate without a task
+    std::deque<Waiter*> ready_;  // this loop's waiters woken at a gate
+    std::vector<std::unique_ptr<Waiter>> seeds_;
+    std::vector<Waiter*> free_seeds_;
+    unsigned gate_timers_ = 0;  // gate spacing timers armed here; other loops' sites may wait on them
+    net::TimerId kick_timer_ = 0;
     bool input_done_ = false;
     bool pumping_ = false;
     bool finishing_ = false;
     net::TimerId dns_timer_ = 0;
     std::string records_;  // serialized records not yet handed to the writer
     uint64_t record_count_ = 0;
+    SiteRecord scratch_;   // records of queued sites cancelled by a stop
 };
 
 // One URL through the pipeline. Classic and real mode share the skeleton:
-//   parse -> unique host -> DNS -> unique IP -> robots -> page.
-// Real mode adds GET robots with RFC 9309 semantics, redirects (each new
-// origin gets DNS and its own robots check, without host/IP dedupe) and TLS.
+//   parse -> unique host -> DNS -> per-IP budget and gate -> robots -> page.
+// Real mode adds GET robots with RFC 9309 semantics (Crawl-delay included),
+// redirects (each new origin gets DNS and its own robots check, without host
+// dedupe or the IP budget), one Retry-After retry, and TLS. Every new
+// connection takes a slot at its IP's gate first (politeness.h).
 class Task final : public FetchHandler {
 public:
     explicit Task(Worker& w)
         : w_(w),
-          conn_(w.loop_, *this, &w.stats_, w.cfg_.insecure ? tls::Verify::None : tls::Verify::Chain) {}
+          conn_(w.loop_, *this, &w.stats_, w.cfg_.insecure ? tls::Verify::None : tls::Verify::Chain) {
+        wait_.owner = &w;
+        wait_.task = this;
+    }
 
-    void start(std::string_view line);
+    void start(std::string_view line);  // a new input line
+    void resume(const Waiter& seed);    // a new site whose gate wait ended
+    void on_gate(GateWaiter::State state);  // this task's own gate wait ended
     void abort();
     bool busy() const { return conn_.busy(); }
 
 private:
     enum class Phase : uint8_t { Idle, Dns, Robots, RobotsDns, Page, PageDns };
     enum class Policy : uint8_t { AllowAll, DisallowAll, Rules };
+    enum class Hold : uint8_t { None, Gate, Timer };  // what a politeness wait waits for
+    enum class WaitFor : uint8_t { Spacing, CrawlDelay, RetryAfter };
 
     bool real() const { return w_.cfg_.mode == Mode::Real; }
+    void reset(std::string_view line);
+    void begin_record();
     void resolve(Phase phase, const std::string& host);
     void on_dns(dns::Status status, uint32_t ipv4_be);
+    void admit_seed(uint32_t ip);
+    void hold_slot(uint32_t ip, bool start_pending);
     void query_https_rr();
     void on_https_rr(dns::Status status, const dns::HttpsRecord& rr);
     void note_fetch(const FetchResult& result);
     void note_tls(const tls::ClientSession& session);
+    void note_outcome(const FetchResult& result);
     void on_fetch(Connection& connection, const FetchResult& result) override;
     void count_failure(FetchError error);
     bool retry_later(FetchError error);
+    bool retry_after(const FetchResult& result);
+    void note_crawl_delay();
 
     void start_robots();
     void fetch_robots();
@@ -155,6 +234,12 @@ private:
     void robots_decided(Policy policy);
     void fetch_page();
     void on_page(const FetchResult& result);
+    void send();
+    void wait(uint32_t ms, WaitFor why);
+    void end_wait();
+    void refused(Admit admit);
+    void release_slot();
+    void note_aborted();
     void finish();
     void complete();
 
@@ -164,10 +249,12 @@ private:
     Worker& w_;
     Connection conn_;
     Phase phase_ = Phase::Idle;
+    std::string_view line_;  // the input line (lives in the input)
     parse::Url page_;    // current page URL (the seed, then redirect hops)
     parse::Url robots_;  // current robots.txt URL (follows robots redirects)
     parse::Url next_;    // scratch for redirect resolution
     std::string request_;
+    FetchOptions opt_;
     uint32_t page_ip_ = 0;
     uint32_t robots_ip_ = 0;
     unsigned robots_hops_ = 0;
@@ -180,20 +267,37 @@ private:
     int last_status_ = 0;
     unsigned port_retries_ = 0;
     net::TimerId retry_timer_ = 0;
+    uint64_t start_ms_ = 0;
+
+    // Politeness.
+    Waiter wait_;                  // this task's own gate waits
+    Hold hold_ = Hold::None;
+    WaitFor wait_for_ = WaitFor::Spacing;
+    bool parked_ = false;          // counted as parked by the worker
+    bool holding_ = false;         // holds a connection slot at held_ip_
+    bool reserved_ = false;        // the next connection start at held_ip_ is already accounted for
+    bool start_pending_ = false;   // ...through a wake or restart(): report started() when connecting
+    uint32_t held_ip_ = 0;
+    Outcome outcome_ = Outcome::None;  // how the current connection went
+    net::TimerId wait_timer_ = 0;
+    uint64_t wait_start_ = 0;
+    std::string delay_host_;       // the host whose robots.txt asked for a Crawl-delay
+    uint32_t delay_ms_ = 0;
+    uint64_t next_request_ms_ = 0; // earliest next request to delay_host_ (loop clock)
+    bool delay_skip_ = false;      // Crawl-delay above the cap: skip the page
+    bool retried_ = false;         // the one Retry-After retry is spent
 
     // --record
     SiteRecord rec_;
     bool rec_active_ = false;      // this URL's host passed dedupe: emit a record
     bool https_pending_ = false;   // an HTTPS RR query is outstanding
     bool done_pending_ = false;    // finished, waiting for the HTTPS RR answer
-    uint64_t start_ms_ = 0;
 };
 
 // ---------------------------------------------------------------- Task
 
-void Task::start(std::string_view line) {
-    CounterBlock& st = w_.stats_;
-    st.add(Counter::UrlsRead);
+void Task::reset(std::string_view line) {
+    line_ = line;
     phase_ = Phase::Idle;
     robots_hops_ = 0;
     page_hops_ = 0;
@@ -204,7 +308,29 @@ void Task::start(std::string_view line) {
     last_status_ = 0;
     port_retries_ = 0;
     rec_active_ = false;
+    holding_ = false;
+    reserved_ = false;
+    start_pending_ = false;
+    outcome_ = Outcome::None;
+    delay_host_.clear();
+    delay_ms_ = 0;
+    next_request_ms_ = 0;
+    delay_skip_ = false;
+    retried_ = false;
+}
 
+void Task::begin_record() {
+    rec_active_ = true;
+    rec_.clear();
+    rec_.url.assign(line_.data(), line_.size());
+    rec_.host.assign(page_.host);
+    rec_.seed_https = page_.scheme == parse::Scheme::Https;
+}
+
+void Task::start(std::string_view line) {
+    CounterBlock& st = w_.stats_;
+    st.add(Counter::UrlsRead);
+    reset(line);
     if (!parse::parse_url(line, page_) || (!real() && page_.scheme != parse::Scheme::Http)) {
         finish();
         return;
@@ -215,15 +341,45 @@ void Task::start(std::string_view line) {
         return;
     }
     st.add(Counter::UniqueHosts);
+    start_ms_ = w_.loop_.now();
     if (w_.recording_) {
-        rec_active_ = true;
-        rec_.clear();
-        rec_.url.assign(line.data(), line.size());
-        rec_.host.assign(page_.host);
-        rec_.seed_https = page_.scheme == parse::Scheme::Https;
-        start_ms_ = w_.loop_.now();
+        begin_record();
     }
     resolve(Phase::Dns, page_.host);
+}
+
+void Task::resume(const Waiter& seed) {
+    reset(seed.line);
+    start_ms_ = seed.start_ms;
+    parse::parse_url(line_, page_);  // parsed once already, before it queued
+    if (w_.recording_) {
+        begin_record();
+        rec_.dns = dns::status_name(dns::Status::Ok);
+        rec_.has_ip = true;
+        rec_.ip = seed.ip;
+        rec_.cf_ip = cloudflare_ipv4().contains(seed.ip);
+        rec_.ip_dup = false;
+    }
+    page_ip_ = seed.ip;
+    const uint64_t waited = w_.loop_.now() - seed.queued_ms;
+    w_.stats_.add(Counter::PoliteWaitMs, waited);
+    if (rec_active_) {
+        rec_.wait_ms += waited;
+    }
+    if (seed.state != GateWaiter::State::Admitted) {
+        // The IP's breaker tripped while this site waited.
+        w_.stats_.add(Counter::IpUnreachable);
+        if (rec_active_) {
+            rec_.skip = "ip_unreachable";
+        }
+        query_https_rr();
+        finish();
+        return;
+    }
+    hold_slot(seed.ip, true);
+    w_.stats_.add(Counter::RobotsAttempted);
+    query_https_rr();
+    start_robots();
 }
 
 void Task::resolve(Phase phase, const std::string& host) {
@@ -260,24 +416,9 @@ void Task::on_dns(dns::Status status, uint32_t ipv4_be) {
             rec_.has_ip = true;
             rec_.ip = ipv4_be;
             rec_.cf_ip = cloudflare_ipv4().contains(ipv4_be);
-            if (w_.cfg_.https_rr) {
-                query_https_rr();
-            }
         }
-        if (!w_.new_ip(ipv4_be)) {
-            if (rec_active_) {
-                rec_.ip_dup = true;
-            }
-            finish();
-            return;
-        }
-        if (rec_active_) {
-            rec_.ip_dup = false;
-        }
-        w_.stats_.add(Counter::UniqueIps);
         page_ip_ = ipv4_be;
-        w_.stats_.add(Counter::RobotsAttempted);
-        start_robots();
+        admit_seed(ipv4_be);
         return;
     case Phase::RobotsDns:
         // A robots.txt redirect to an unresolvable host: unreachable.
@@ -308,6 +449,56 @@ void Task::on_dns(dns::Status status, uint32_t ipv4_be) {
     }
 }
 
+void Task::admit_seed(uint32_t ip) {
+    CounterBlock& st = w_.stats_;
+    Waiter* seed = w_.take_seed();
+    seed->line = line_;
+    seed->start_ms = start_ms_;
+    seed->queued_ms = w_.loop_.now();
+    const SeedResult r = w_.gates_.seed(ip, seed, gate_clock_ms(), w_);
+    if (r.budget == Budget::Over || r.budget == Budget::Unreachable) {
+        w_.give_seed(seed);
+        const bool over = r.budget == Budget::Over;
+        st.add(over ? Counter::IpBudgetSkips : Counter::IpUnreachable);
+        if (rec_active_) {
+            rec_.ip_dup = over;
+            rec_.skip = over ? "ip_budget" : "ip_unreachable";
+        }
+        query_https_rr();  // DNS-level facts cover every resolving host
+        finish();
+        return;
+    }
+    st.add(r.budget == Budget::First ? Counter::UniqueIps : Counter::IpExtraHosts);
+    if (r.cdn) {
+        st.add(Counter::CdnHosts);
+    }
+    if (rec_active_) {
+        rec_.ip_dup = false;
+    }
+    if (r.admit == Admit::Queued) {
+        // Wait without a task: once the gate admits the site, the loop
+        // resumes it in a free task, which writes its record.
+        st.add(Counter::PoliteWaits);
+        rec_active_ = false;
+        phase_ = Phase::Idle;
+        w_.seed_queued();
+        w_.task_done(this);
+        return;
+    }
+    w_.give_seed(seed);
+    hold_slot(ip, false);
+    st.add(Counter::RobotsAttempted);
+    query_https_rr();
+    start_robots();
+}
+
+void Task::hold_slot(uint32_t ip, bool start_pending) {
+    holding_ = true;
+    held_ip_ = ip;
+    reserved_ = true;  // admission already counted this connection start
+    start_pending_ = start_pending;
+}
+
 void Task::start_robots() {
     // robots.txt of the page's origin.
     robots_ = page_;
@@ -325,13 +516,13 @@ void Task::fetch_robots() {
     phase_ = Phase::Robots;
     const Config& cfg = w_.cfg_;
     build_request(real() ? "GET" : "HEAD", robots_);
-    FetchOptions opt;
-    opt.head = !real();
-    opt.limit = static_cast<size_t>(cfg.robots_limit);
-    opt.timeout_ms = cfg.timeout_ms;
-    opt.connect_timeout_ms = cfg.connect_timeout_ms;
-    opt.keep_alive = cfg.keepalive;
-    conn_.fetch(endpoint(robots_, robots_ip_), request_, opt);
+    opt_ = FetchOptions{};
+    opt_.head = !real();
+    opt_.limit = static_cast<size_t>(cfg.robots_limit);
+    opt_.timeout_ms = cfg.timeout_ms;
+    opt_.connect_timeout_ms = cfg.connect_timeout_ms;
+    opt_.keep_alive = cfg.keepalive;
+    send();
 }
 
 void Task::fetch_page() {
@@ -346,18 +537,195 @@ void Task::fetch_page() {
     }
     const Config& cfg = w_.cfg_;
     build_request("GET", page_);
-    FetchOptions opt;
-    opt.head = false;
-    opt.limit = static_cast<size_t>(cfg.page_limit);
-    opt.timeout_ms = cfg.timeout_ms;
-    opt.connect_timeout_ms = cfg.connect_timeout_ms;
-    opt.keep_alive = cfg.keepalive;
-    conn_.fetch(endpoint(page_, page_ip_), request_, opt);
+    opt_ = FetchOptions{};
+    opt_.head = false;
+    opt_.limit = static_cast<size_t>(cfg.page_limit);
+    opt_.timeout_ms = cfg.timeout_ms;
+    opt_.connect_timeout_ms = cfg.connect_timeout_ms;
+    opt_.keep_alive = cfg.keepalive;
+    send();
+}
+
+// Sends request_ for the current phase once politeness allows: the host's
+// Crawl-delay first, then a connection slot at the IP, or only the IP's
+// spacing when this site already holds a slot there. Waits hold no socket.
+void Task::send() {
+    if (w_.stopping_) {
+        finish();
+        return;
+    }
+    const bool robots = phase_ == Phase::Robots;
+    const parse::Url& url = robots ? robots_ : page_;
+    const uint32_t ip = robots ? robots_ip_ : page_ip_;
+    const Endpoint ep = endpoint(url, ip);
+    const uint64_t now = w_.loop_.now();
+    if (delay_ms_ != 0 && now < next_request_ms_ && url.host == delay_host_) {
+        release_slot();
+        w_.stats_.add(Counter::CrawlDelayWaits);
+        wait(static_cast<uint32_t>(next_request_ms_ - now), WaitFor::CrawlDelay);
+        return;
+    }
+    if (conn_.reuses(ep)) {
+        conn_.fetch(ep, request_, opt_);
+        return;
+    }
+    if (holding_ && held_ip_ == ip) {
+        // A new connection where this site already holds a slot (reconnect
+        // after Connection: close, http -> https, another host on the same
+        // IP): concurrency is unchanged, only the spacing applies.
+        if (!reserved_) {
+            conn_.close();
+            const uint32_t ms = w_.gates_.restart(ip, outcome_, gate_clock_ms());
+            outcome_ = Outcome::None;
+            reserved_ = true;
+            start_pending_ = true;
+            if (ms != 0) {
+                w_.stats_.add(Counter::PoliteWaits);
+                wait(ms, WaitFor::Spacing);
+                return;
+            }
+        }
+        reserved_ = false;
+        if (start_pending_) {
+            start_pending_ = false;
+            w_.gates_.started(ip, gate_clock_ms(), w_);
+        }
+        conn_.fetch(ep, request_, opt_);
+        return;
+    }
+    // Another IP: give the old slot back before asking for one there, so a
+    // task never waits while holding a slot.
+    release_slot();
+    const Admit admit = w_.gates_.acquire(ip, &wait_, kMaxHopWaiters, gate_clock_ms(), w_);
+    switch (admit) {
+    case Admit::Now:
+        hold_slot(ip, false);
+        reserved_ = false;
+        conn_.fetch(ep, request_, opt_);
+        return;
+    case Admit::Queued:
+        w_.stats_.add(Counter::PoliteWaits);
+        hold_ = Hold::Gate;
+        wait_start_ = now;
+        w_.park(parked_);
+        return;
+    case Admit::Busy:
+    case Admit::Unreachable:
+        refused(admit);
+        return;
+    }
+}
+
+void Task::wait(uint32_t ms, WaitFor why) {
+    hold_ = Hold::Timer;
+    wait_for_ = why;
+    wait_start_ = w_.loop_.now();
+    w_.park(parked_);
+    wait_timer_ = w_.loop_.add_timer(ms, [this] {
+        wait_timer_ = 0;
+        end_wait();
+        send();
+    });
+}
+
+void Task::end_wait() {
+    hold_ = Hold::None;
+    w_.unpark(parked_);
+    const uint64_t waited = w_.loop_.now() - wait_start_;
+    if (rec_active_) {
+        rec_.wait_ms += waited;
+    }
+    switch (wait_for_) {
+    case WaitFor::Spacing:
+        w_.stats_.add(Counter::PoliteWaitMs, waited);
+        break;
+    case WaitFor::CrawlDelay:
+        w_.stats_.add(Counter::CrawlDelayMs, waited);
+        if (rec_active_) {
+            rec_.crawl_delay_ms += waited;
+        }
+        break;
+    case WaitFor::RetryAfter:
+        break;
+    }
+}
+
+void Task::on_gate(GateWaiter::State state) {
+    hold_ = Hold::None;
+    w_.unpark(parked_);
+    const uint64_t waited = w_.loop_.now() - wait_start_;
+    w_.stats_.add(Counter::PoliteWaitMs, waited);
+    if (rec_active_) {
+        rec_.wait_ms += waited;
+    }
+    if (state == GateWaiter::State::Admitted) {
+        hold_slot(wait_.ip, true);
+    }
+    if (w_.stopping_) {
+        note_aborted();
+        finish();
+        return;
+    }
+    if (state != GateWaiter::State::Admitted) {
+        refused(Admit::Unreachable);
+        return;
+    }
+    send();
+}
+
+// The gate turned a connection of a site under way down: a redirect to an IP
+// that is unreachable or has too many sites waiting.
+void Task::refused(Admit admit) {
+    const char* why = admit == Admit::Busy ? "ip_busy" : "ip_unreachable";
+    w_.stats_.add(Counter::IpBusy);
+    if (phase_ == Phase::Robots && funnel_) {
+        if (rec_active_) {
+            rec_.robots_error = why;
+        }
+        robots_decided(Policy::DisallowAll);  // unreachable robots.txt (RFC 9309 §2.3.1.4)
+        return;
+    }
+    if (rec_active_) {
+        rec_.fetch = why;
+    }
+    finish();
+}
+
+void Task::release_slot() {
+    conn_.close();  // RST: no TIME_WAIT
+    if (!holding_) {
+        return;
+    }
+    holding_ = false;
+    reserved_ = false;
+    w_.gates_.release(held_ip_, outcome_, start_pending_, gate_clock_ms(), w_);
+    start_pending_ = false;
+    outcome_ = Outcome::None;
+}
+
+void Task::note_outcome(const FetchResult& result) {
+    if (result.error == FetchError::None) {
+        if (throttled(result.status)) {
+            w_.stats_.add(Counter::Throttled);
+            outcome_ = Outcome::Throttled;
+        } else if (outcome_ != Outcome::Throttled) {
+            outcome_ = Outcome::Replied;
+        }
+    } else if ((result.error == FetchError::ConnectFail || result.error == FetchError::Timeout) &&
+               outcome_ == Outcome::None) {
+        outcome_ = Outcome::Failed;  // nothing ever replied on this connection
+    }
 }
 
 void Task::on_fetch(Connection&, const FetchResult& result) {
+    note_outcome(result);
     if (rec_active_) {
         note_fetch(result);
+    }
+    // Crawl-delay spaces every request to the host that asked for it.
+    const parse::Url& url = phase_ == Phase::Robots ? robots_ : page_;
+    if (delay_ms_ != 0 && url.host == delay_host_) {
+        next_request_ms_ = w_.loop_.now() + delay_ms_;
     }
     if (phase_ == Phase::Robots) {
         on_robots(result);
@@ -404,8 +772,56 @@ bool Task::retry_later(FetchError error) {
     return true;
 }
 
+// Real mode: a 429/503 whose Retry-After is within --max-retry-after is
+// waited out (without a socket) and the request repeated, once per site.
+// The release reports the throttle, which backs off the IP's spacing.
+bool Task::retry_after(const FetchResult& result) {
+    if (result.error != FetchError::None || !throttled(result.status)) {
+        return false;
+    }
+    const std::optional<uint64_t> s = retry_after_s(*result.reply);
+    if (!s) {
+        return false;
+    }
+    if (rec_active_ && !rec_.retry_after) {
+        rec_.retry_after = *s;
+        rec_.retried = false;
+    }
+    if (!real() || retried_ || w_.stopping_ || *s > w_.cfg_.max_retry_after_s) {
+        return false;
+    }
+    retried_ = true;
+    if (rec_active_) {
+        rec_.retried = true;
+    }
+    w_.stats_.add(Counter::RetryAfterRetries);
+    release_slot();
+    wait(static_cast<uint32_t>(*s * 1000), WaitFor::RetryAfter);
+    return true;
+}
+
+void Task::note_crawl_delay() {
+    const std::optional<double> delay = rules_.crawl_delay();
+    if (!delay) {
+        return;
+    }
+    if (rec_active_ && funnel_) {
+        rec_.crawl_delay = *delay;
+    }
+    if (*delay <= 0) {
+        return;
+    }
+    if (*delay > static_cast<double>(w_.cfg_.max_crawl_delay_s)) {
+        delay_skip_ = true;  // robots_decided() skips the page
+        return;
+    }
+    delay_host_.assign(robots_.host);
+    delay_ms_ = static_cast<uint32_t>(std::ceil(*delay * 1000.0));
+    next_request_ms_ = w_.loop_.now() + delay_ms_;
+}
+
 void Task::on_robots(const FetchResult& result) {
-    if (retry_later(result.error)) {
+    if (retry_later(result.error) || retry_after(result)) {
         return;
     }
     if (result.error != FetchError::None) {
@@ -444,6 +860,7 @@ void Task::on_robots(const FetchResult& result) {
     }
     if (status >= 200 && status < 300) {
         rules_ = parse::RobotsRules::parse(result.body, kRobotsToken);
+        note_crawl_delay();
         robots_decided(Policy::Rules);
     } else if (status >= 300 && status < 400) {
         const std::string_view location = result.reply->header("Location");
@@ -459,6 +876,10 @@ void Task::on_robots(const FetchResult& result) {
         } else {
             resolve(Phase::RobotsDns, robots_.host);
         }
+    } else if (status == 429) {
+        // Rate limited: treat like a server error, as Google does, rather
+        // than as "no robots.txt" (§2.3.1.3 would allow everything).
+        robots_decided(Policy::DisallowAll);
     } else if (status >= 400 && status < 500) {
         robots_decided(Policy::AllowAll);  // §2.3.1.3: unavailable
     } else {
@@ -484,11 +905,24 @@ void Task::robots_decided(Policy policy) {
         finish();
         return;
     }
+    if (delay_skip_) {
+        // Honouring a Crawl-delay above --max-crawl-delay would hold the
+        // site longer than the run is willing to wait: skip the page.
+        w_.stats_.add(Counter::CrawlDelaySkips);
+        if (rec_active_) {
+            rec_.skip = "crawl_delay";
+            if (page_attempted_) {
+                rec_.fetch = "crawl_delay";  // a redirect led there
+            }
+        }
+        finish();
+        return;
+    }
     fetch_page();
 }
 
 void Task::on_page(const FetchResult& result) {
-    if (retry_later(result.error)) {
+    if (retry_later(result.error) || retry_after(result)) {
         return;
     }
     if (result.error != FetchError::None) {
@@ -552,7 +986,7 @@ void Task::finish() {
         w_.stats_.add(status_counter(last_status_));
     }
     phase_ = Phase::Idle;
-    conn_.close();  // RST: no TIME_WAIT, the next URL needs a different server anyway
+    release_slot();  // also resets the connection: the next URL needs a different server anyway
     if (rec_active_) {
         rec_.redirects = page_hops_;
     }
@@ -573,6 +1007,9 @@ void Task::complete() {
 }
 
 void Task::query_https_rr() {
+    if (!rec_active_ || !w_.cfg_.https_rr) {
+        return;
+    }
     https_pending_ = true;
     w_.resolver_.resolve_https(page_.host,
                                [this](dns::Status status, const dns::HttpsRecord& rr) { on_https_rr(status, rr); });
@@ -635,6 +1072,17 @@ void Task::note_tls(const tls::ClientSession& session) {
     t.resumed = info.resumed;
 }
 
+void Task::note_aborted() {
+    if (!rec_active_) {
+        return;
+    }
+    if (phase_ == Phase::Robots && funnel_) {
+        rec_.robots_error = fetch_error_name(FetchError::Aborted);
+    } else if (phase_ == Phase::Robots || phase_ == Phase::Page) {
+        rec_.fetch = fetch_error_name(FetchError::Aborted);
+    }
+}
+
 void Task::abort() {
     if (retry_timer_ != 0) {
         // Waiting out port exhaustion: nothing is in flight, end it here.
@@ -642,6 +1090,23 @@ void Task::abort() {
         retry_timer_ = 0;
         finish();
         return;
+    }
+    if (hold_ == Hold::Timer) {
+        w_.loop_.cancel_timer(wait_timer_);
+        wait_timer_ = 0;
+        end_wait();
+        note_aborted();
+        finish();
+        return;
+    }
+    if (hold_ == Hold::Gate) {
+        if (w_.gates_.cancel(&wait_)) {
+            hold_ = Hold::None;
+            w_.unpark(parked_);
+            note_aborted();
+            finish();
+        }
+        return;  // otherwise its wake is on the way and on_gate() ends the task
     }
     if (phase_ == Phase::Robots || phase_ == Phase::Page) {
         conn_.abort();
@@ -696,7 +1161,9 @@ Worker::Worker(Engine& engine, size_t index, unsigned slots, unsigned dns_inflig
       cfg_(engine.config_),
       stats_(engine.stats_.block(index)),
       resolver_(loop_, resolver_config(engine.config_, dns_inflight, dns_servers)),
-      recording_(engine.records_.is_open()) {
+      gates_(engine.gates_),
+      recording_(engine.records_.is_open()),
+      slots_(slots) {
     tasks_.reserve(slots);
     free_.reserve(slots);
     for (unsigned i = 0; i < slots; ++i) {
@@ -740,11 +1207,23 @@ void Worker::stop() {
         return;
     }
     stopping_ = true;
-    for (auto& task : tasks_) {
-        task->abort();  // may finish the task synchronously
+    // By index: a task finishing here may run pump(), which never adds
+    // tasks while stopping, but keep the bound fixed anyway.
+    for (size_t i = 0, n = tasks_.size(); i < n; ++i) {
+        tasks_[i]->abort();  // may finish the task synchronously
     }
+    // New sites still queued at a gate end here; ones already woken arrive
+    // through ready_ and end in pump().
+    for (const auto& seed : seeds_) {
+        if (seed->in_use && gates_.cancel(seed.get())) {
+            --queued_seeds_;
+            end_seed(seed.get());
+        }
+    }
+    update_gauges();
     // Fails queued and in-flight lookups (Timeout); their tasks then finish.
     resolver_.shutdown();
+    kick();
     maybe_finish();
 }
 
@@ -754,7 +1233,8 @@ bool Worker::next_url(std::string_view& out) {
         batch_pos_ = 0;
         // Never buffer more URLs than this loop has free slots: at the tail
         // of the input, surplus would wait here while other loops sit idle.
-        const size_t want = std::min(kClaimBatch, std::max<size_t>(free_.size(), 1));
+        const size_t room = slots_ > running_ ? slots_ - running_ : 1;
+        const size_t want = std::min(kClaimBatch, room);
         if (input_done_ || engine_.input_.claim(want, batch_) == 0) {
             input_done_ = true;
             return false;
@@ -764,20 +1244,75 @@ bool Worker::next_url(std::string_view& out) {
     return true;
 }
 
+Task* Worker::take_task(bool admitted_seed) {
+    if (!free_.empty()) {
+        Task* task = free_.back();
+        free_.pop_back();
+        return task;
+    }
+    // Parked tasks keep their task objects, so the pool grows past the slot
+    // count (to twice it for new URLs). A site woken at its gate holds a
+    // connection slot there and always gets a task: making it wait for one
+    // could deadlock against tasks parked behind that very slot.
+    if (admitted_seed || tasks_.size() < 2 * static_cast<size_t>(slots_)) {
+        tasks_.push_back(std::make_unique<Task>(*this));
+        return tasks_.back().get();
+    }
+    return nullptr;
+}
+
+void Worker::kick() {
+    if (kick_timer_ != 0 || finishing_) {
+        return;
+    }
+    // Never inline: callers are deep inside a task's or a gate's code.
+    kick_timer_ = loop_.add_timer(0, [this] {
+        kick_timer_ = 0;
+        pump();
+    });
+}
+
 void Worker::pump() {
     if (pumping_) {
         return;  // a task finished synchronously inside the loop below
     }
     pumping_ = true;
-    while (!stopping_ && !free_.empty()) {
-        std::string_view line;
-        if (!next_url(line)) {
+    for (;;) {
+        // Sites woken at their gate first: they hold (or were refused) a slot.
+        if (!ready_.empty()) {
+            Waiter* waiter = ready_.front();
+            ready_.pop_front();
+            if (waiter->task != nullptr) {
+                waiter->task->on_gate(waiter->state);
+                continue;
+            }
+            --queued_seeds_;
+            if (stopping_) {
+                end_seed(waiter);
+                continue;
+            }
+            Task* task = take_task(true);
+            ++running_;
+            update_gauges();
+            const Waiter seed = *waiter;
+            give_seed(waiter);
+            task->resume(seed);
+            continue;
+        }
+        if (stopping_ || running_ >= slots_) {
             break;
         }
-        Task* task = free_.back();
-        free_.pop_back();
-        ++live_;
-        stats_.set(Counter::Inflight, live_);
+        Task* task = take_task(false);
+        if (task == nullptr) {
+            break;
+        }
+        std::string_view line;
+        if (!next_url(line)) {
+            free_.push_back(task);
+            break;
+        }
+        ++running_;
+        update_gauges();
         task->start(line);  // may finish synchronously (bad URL, duplicate host)
     }
     pumping_ = false;
@@ -786,8 +1321,8 @@ void Worker::pump() {
 
 void Worker::task_done(Task* task) {
     free_.push_back(task);
-    --live_;
-    stats_.set(Counter::Inflight, live_);
+    --running_;
+    update_gauges();
     pump();
 }
 
@@ -802,11 +1337,130 @@ void Worker::emit(const SiteRecord& record) {
     }
 }
 
-void Worker::maybe_finish() {
-    if (finishing_ || live_ != 0 || !(input_done_ || stopping_)) {
+Waiter* Worker::take_seed() {
+    Waiter* waiter;
+    if (!free_seeds_.empty()) {
+        waiter = free_seeds_.back();
+        free_seeds_.pop_back();
+    } else {
+        seeds_.push_back(std::make_unique<Waiter>());
+        waiter = seeds_.back().get();
+        waiter->owner = this;
+    }
+    waiter->in_use = true;
+    waiter->state = GateWaiter::State::Idle;
+    return waiter;
+}
+
+void Worker::give_seed(Waiter* waiter) {
+    waiter->in_use = false;
+    waiter->state = GateWaiter::State::Idle;
+    free_seeds_.push_back(waiter);
+}
+
+void Worker::seed_queued() {
+    ++queued_seeds_;
+    update_gauges();
+}
+
+void Worker::park(bool& counted) {
+    ++waiting_tasks_;
+    if (parked_ < slots_) {
+        ++parked_;
+        --running_;
+        counted = true;
+        kick();  // a slot opened
+    }
+    update_gauges();
+}
+
+void Worker::unpark(bool& counted) {
+    --waiting_tasks_;
+    if (counted) {
+        counted = false;
+        --parked_;
+        ++running_;
+    }
+    update_gauges();
+}
+
+void Worker::on_wake(GateWaiter* gate_waiter) {
+    auto* waiter = static_cast<Waiter*>(gate_waiter);
+    Worker* owner = waiter->owner;
+    if (owner == this) {
+        ready_.push_back(waiter);
+        kick();
         return;
     }
+    owner->loop_.post([owner, waiter] {
+        owner->ready_.push_back(waiter);
+        owner->kick();
+    });
+}
+
+void Worker::arm_gate_timer(uint32_t ip, uint32_t delay_ms) {
+    ++gate_timers_;
+    loop_.add_timer(delay_ms, [this, ip] {
+        --gate_timers_;
+        gates_.on_timer(ip, gate_clock_ms(), *this);
+        maybe_finish();
+    });
+}
+
+// A new site that waited at a gate ends without a task: the run is stopping.
+void Worker::end_seed(Waiter* waiter) {
+    if (waiter->state == GateWaiter::State::Admitted) {
+        gates_.release(waiter->ip, Outcome::None, true, gate_clock_ms(), *this);
+    }
+    const bool unreachable = waiter->state == GateWaiter::State::Unreachable;
+    if (unreachable) {
+        stats_.add(Counter::IpUnreachable);
+    }
+    if (recording_) {
+        SiteRecord& r = scratch_;
+        r.clear();
+        r.url.assign(waiter->line.data(), waiter->line.size());
+        parse::Url url;
+        parse::parse_url(waiter->line, url);
+        r.host = url.host;
+        r.seed_https = url.scheme == parse::Scheme::Https;
+        r.dns = dns::status_name(dns::Status::Ok);
+        r.has_ip = true;
+        r.ip = waiter->ip;
+        r.cf_ip = cloudflare_ipv4().contains(waiter->ip);
+        r.ip_dup = false;
+        if (unreachable) {
+            r.skip = "ip_unreachable";
+        } else {
+            r.robots_error = fetch_error_name(FetchError::Aborted);
+        }
+        if (cfg_.https_rr) {
+            r.https_rr.status = "cancelled";
+        }
+        r.wait_ms = loop_.now() - waiter->queued_ms;
+        r.ms = loop_.now() - waiter->start_ms;
+        emit(r);
+    }
+    give_seed(waiter);
+}
+
+void Worker::update_gauges() {
+    stats_.set(Counter::Inflight, live());
+    stats_.set(Counter::PoliteWaiting, waiting_tasks_ + queued_seeds_);
+}
+
+void Worker::maybe_finish() {
+    if (finishing_ || live() != 0 || !(input_done_ || stopping_)) {
+        return;
+    }
+    if (gate_timers_ != 0 && !stopping_) {
+        return;  // sites of other loops may be waiting for those timers
+    }
     finishing_ = true;
+    if (kick_timer_ != 0) {
+        loop_.cancel_timer(kick_timer_);
+        kick_timer_ = 0;
+    }
     if (recording_) {
         engine_.records_.submit(records_);
         engine_.records_written_.fetch_add(record_count_, std::memory_order_relaxed);
@@ -844,7 +1498,11 @@ void Worker::sync_dns_counters() {
 // ---------------------------------------------------------------- Engine
 
 Engine::Engine(const Config& config, UrlInput& input, Stats& stats)
-    : config_(config), input_(input), stats_(stats), hosts_(input.total()), ips_(input.total()) {}
+    : config_(config),
+      input_(input),
+      stats_(stats),
+      hosts_(input.total()),
+      gates_(gate_policy(config), input.total()) {}
 
 Engine::~Engine() = default;
 
