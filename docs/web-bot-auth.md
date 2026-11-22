@@ -198,6 +198,34 @@ Cloudflare's Verified Bots) are in
 [`tools/bot-auth-directory/README.md`](../tools/bot-auth-directory/README.md).
 It is not deployed: that needs the owner's Cloudflare account.
 
+## Running wincrawl signed
+
+```powershell
+build\release\wincrawl.exe --bot-auth-key secrets\bot-auth.jwk `
+    --signature-agent https://bot-auth-directory.<sub>.workers.dev --mode real urls.txt
+```
+
+Both options are needed together; the URL must be https. The header block
+gains `Web Bot Auth: signing every request, keyid …, Signature-Agent "…"`,
+and `--json` ends with `"bot_auth":true`. Every request (robots.txt, the
+page, each redirect hop, classic and real mode, and classic
+`--no-keepalive`'s HTTP/1.0 requests) carries the three headers, signed for
+that request's own `@authority` (its `Host` value), valid for 60 s, with a
+fresh 64-byte nonce. The engine change is small: `Worker` owns one
+`sig::RequestSigner` (so no locks) and a reused authority buffer, and
+`Task::build_request` hands the signer's header block to
+`parse::append_request` (new `extra_headers` argument) or appends it to the
+HTTP/1.0 request. The crawl end-to-end tests run classic keep-alive,
+`--no-keepalive` and real-mode crawls (with same-host and cross-host
+redirects) against a fake server that verifies every request with
+`sig::verify_signatures`; all requests verify.
+
+Live, through the crawler itself (2026-11-22, real mode, one URL,
+`https://crawltest.com/cdn-cgi/web-bot-auth`, `--record`): signed with an
+unregistered key the page's status is 401 (well-formed, key unknown to
+Cloudflare); the same run without `--bot-auth-key` gets 400 (missing
+headers). The robots.txt fetch before it was signed too and returned 200.
+
 ## Verification results
 
 All of the following were run on 2026-11-22.
@@ -297,8 +325,23 @@ Signature"). The deploy README ends with that check.
 | bytes added to each request | 428 (sf-string `Signature-Agent` of 23 characters) |
 | `verify_signatures()` per request (parse + base + verify) | 65–66 µs |
 
-At the crawler's ~5K requests/s that is ~0.12 CPU-seconds per second spread
-over all loops (under 1% per loop with 16 loops).
+At the crawler's ~5K requests/s on the internet that is 0.12–0.27
+CPU-seconds per second spread over all loops (by the single-thread and the
+rig figures below), at most ~2% of each of 16 loops.
+
+On the loopback rig (`wincrawl-benchd serve --profile lan`, HTTP 58080, DNS
+55300; 50,000 generated URLs, ~51,350 requests per run; `-c 2000`, 16 loops;
+release build; runs alternated):
+
+| | Wall time | URLs/s | Process CPU |
+|---|---:|---:|---:|
+| unsigned (3 runs) | 4.32 / 4.67 / 4.64 s | 10.7–11.6K | 26.98 / 28.33 / 27.88 s |
+| signed (3 runs) | 4.67 / 4.79 / 4.73 s | 10.4–10.7K | 30.55 / 30.67 / 30.17 s |
+
+Signing every request cost +2.7 CPU-seconds per run (+10%), about 53 µs of
+CPU per request: twice the single-thread bench, as 16 loops share 8 cores'
+execution units. Throughput dropped ~4% (4.54 → 4.73 s mean), on a rig
+where the kernel's connection setup, not the crawler, is the bottleneck.
 
 ## Limitations
 
