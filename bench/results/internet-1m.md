@@ -36,9 +36,14 @@ Notes:
 - Links are counted by different parsers. The legacy course parser counts
   only `http://` links. wincrawl counts http and https `<a>`/`<area>` links
   (see `src/parse/links.h`).
-- Both wincrawl runs held their concurrency limit for the entire run, so the
-  limit, not CPU, is what set throughput. At `-c 12000` the extra DNS load
-  shows up as more retries and timeouts (49.2% vs 50.7% OK).
+- **Correction (from the later tuning study):** the two wincrawl columns are
+  different builds. `22a9007` predates the engine review fixes; `a5acfcc`
+  includes them. On a single build, `-c 12000` measured 159.7 s and the
+  defaults 159.8–169.1 s (see `internet-tuning.md`). The speedup between the
+  two columns came from the build or that evening's network conditions, not
+  from the higher concurrency. The home router's packet rate (~25K
+  packets/s) is the ceiling. At `-c 12000` the
+  extra DNS load shows up as more retries and timeouts (49.2% vs 50.7% OK).
 
 ## Real mode
 
