@@ -3,36 +3,30 @@
 What comes next, in priority order. Each item names the evidence behind it.
 Finished work is described in the README and the other notes in `docs/`.
 
-## 1. Crawl politely enough to drop IP dedupe
+## Done
 
-The study's page-level numbers (TLS, HTTP/3, HSTS) describe "the first site
-on each IP": the assignment's IP dedupe skipped 72.6% of resolving hosts in
-the 1M study (CDNs, shared hosting). Dropping the dedupe is only acceptable
-with per-target
-politeness:
+- **Politeness, so studies cover every host.** `--hosts-per-ip`, per-IP
+  connection caps and spacing shared across loops, 429/503 back-off with
+  `Retry-After`, `Crawl-delay`, CDN-aware limits, and an IP-weighted analyzer
+  ([`politeness.md`](politeness.md)). The rerun of the 1M study is in
+  [`study-2026.md`](study-2026.md).
+- **Web Bot Auth.** RFC 9421 Ed25519 signatures on every request, the
+  `wincrawl-botauth` key tool and the directory Worker
+  ([`web-bot-auth.md`](web-bot-auth.md)). What remains is for the owner:
+  deploy the Worker and register the key with Cloudflare's Bot Submission
+  Form, which turns production's 401 "unknown public key" into verified-bot
+  status.
 
-- per-IP and per-host connection caps and request-rate budgets, a small
-  per-loop token bucket keyed by IP;
-- `Crawl-delay` honoured (already parsed by `RobotsRules`);
-- backoff on 429/503 and `Retry-After`.
+## 1. Web Bot Auth follow-ups
 
-Then add `--no-ip-dedupe` for measurement runs and rerun the study over every
-resolving host.
+- **Deploy the key directory and register it** (steps in
+  `tools/bot-auth-directory/README.md`).
+- **Switch to dictionary-form `Signature-Agent`** once Cloudflare's verifier
+  accepts it; the IETF draft already requires it, and the signer supports it.
+- **Cover more components** (`@path`, `@method`) if the draft adds them. This
+  narrows replay to the same request.
 
-## 2. Web Bot Auth
-
-Sign requests per Cloudflare's
-[Web Bot Auth](https://blog.cloudflare.com/web-bot-auth) draft
-([draft-ietf-webbotauth-httpsig-protocol](https://datatracker.ietf.org/doc/draft-ietf-webbotauth-httpsig-protocol)):
-
-- RFC 9421 HTTP Message Signatures with an Ed25519 key, plus the
-  `Signature-Agent` header;
-- a key directory served from a domain I control.
-
-Open question: whether Windows CNG supports Ed25519. If it doesn't, vendor a
-small audited implementation.
-
-## 3. Profile-guided CPU wins (measured, not yet applied)
+## 2. Profile-guided CPU wins (measured, not yet applied)
 
 From [`profiling.md`](profiling.md):
 
@@ -48,7 +42,7 @@ and by kernel connection setup on loopback. They lower CPU per URL, which
 matters once more work (HTTP/2, rendering hints, content hashing) moves into
 the loop.
 
-## 4. A Linux backend
+## 3. A Linux backend
 
 Cloudflare-scale networking runs on Linux. Two options:
 
@@ -61,7 +55,7 @@ Cloudflare-scale networking runs on Linux. Two options:
 
 Pick one, not both.
 
-## 5. Protocols
+## 4. Protocols
 
 - **HTTP/3 over QUIC:** today h3 support is inferred from Alt-Svc and HTTPS
   RRs. Actually connecting (msquic on Windows, quiche elsewhere) would measure
@@ -71,16 +65,25 @@ Pick one, not both.
 - **DNS over TCP** for truncated replies, Extended DNS Errors, and DoH/DoT to
   the configured resolvers.
 
-## 6. Study follow-ups
+## 5. Study follow-ups
 
+- **`--deadline`:** stop intake and drain at a wall-clock limit through the
+  Ctrl+C path, so every host gets a record. The no-dedupe run was hard-killed
+  at 60 minutes with 0.6% of hosts unrecorded
+  ([`politeness.md`](politeness.md)).
+- **Calibrate `estimate.py` per IP class.** It predicted 30 minutes. 98.5% of
+  the work was done by then, but the biggest parking and bulk-hosting IPs
+  drain at about 1 site/s, not the modelled 2 per 1.8 s.
 - **Repeat runs** to report change over time (PQ and ECH adoption move monthly).
-- **Distinguish failure causes** for certificate failures: missing local roots
-  vs expired vs name mismatch. Load the full Windows Update root set before the
-  run.
+- **Distinguish failure causes** for certificate failures: expired vs name
+  mismatch vs untrusted. The full root set is loaded now, so what remains
+  should be real.
 - **Compare against the Tranco top list**, so findings about long-tail 2015
   sites can be set against today's popular sites.
+- **Test whether the hosts behind a shared IP really are parked or bulk
+  hosting.** That is the likely explanation for the run 1 vs run 2 gap.
 
-## 7. Crawl the frontier
+## 6. Crawl the frontier
 
 wincrawl counts links but never follows them. An IRLbot-style frontier
 ([Lee et al., WWW 2008](https://irl.cse.tamu.edu/people/hsin-tsang/papers/www2008.pdf)):
@@ -90,7 +93,8 @@ wincrawl counts links but never follows them. An IRLbot-style frontier
 - politeness scheduling (BEAST).
 
 These would turn it from a seed-list fetcher into a real crawler. It's the
-natural continuation of the course and builds on item 1.
+natural continuation of the course and builds on the per-IP gates
+(politeness), which BEAST-style budgets would extend.
 
 ## Housekeeping
 

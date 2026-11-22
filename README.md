@@ -52,10 +52,11 @@ faster, and a local Unbound resolver is 2–6× slower than 1.1.1.1. Details:
 [`bench/results/internet-tuning.md`](bench/results/internet-tuning.md).
 
 Real mode (https, redirects, RFC 9309 robots.txt) handled the same list in
-309–422 s: ~73K pages, ~4 GB and ~3.8M links, with ~34K redirects followed.
-It also doubles as a measurement instrument. In the 2026 study of this list,
-47% of completed TLS handshakes negotiated post-quantum X25519MLKEM768
-(of TLS 1.3 handshakes: 99% behind Cloudflare, 38% elsewhere), and ECH in DNS turned out to be essentially
+309–422 s with one host per IP: ~73K pages, ~4 GB and ~3.8M links, with ~34K
+redirects followed. It also doubles as a measurement instrument. A second,
+polite run fetched 345K hosts (every host up to 2,000 per IP). It found
+post-quantum X25519MLKEM768 on 67% of TLS 1.3 handshakes (99% behind
+Cloudflare, 46% elsewhere), and ECH in DNS turned out to be essentially
 Cloudflare-only. Full write-up:
 [what the 2015 web looks like in 2026](docs/study-2026.md).
 
