@@ -53,6 +53,9 @@ public:
     ~FakeDns();
 
     void add(const std::string& host, uint32_t ipv4_be);  // A record; other names get NXDOMAIN
+    // HTTPS record (type 65) with this raw RDATA for a name added with add();
+    // names without one answer HTTPS queries with NODATA.
+    void add_https(const std::string& host, std::string rdata);
 
     // Binds 127.0.0.1:0; returns the bound port (host order).
     uint16_t start();
@@ -64,6 +67,7 @@ private:
     ServerThread& thread_;
     std::unique_ptr<net::UdpSocket> socket_;
     std::map<std::string, uint32_t> records_;
+    std::map<std::string, std::string> https_;
     std::atomic<uint64_t> queries_{0};
 };
 

@@ -6,6 +6,7 @@
 #include "crawl/input.h"
 #include "crawl/stats.h"
 #include "net/addr.h"
+#include "tls/tls.h"
 
 #include <windows.h>
 
@@ -81,6 +82,17 @@ int main(int argc, char** argv) {
     }
     std::printf("DNS %s, %u in flight, %u ms x %u attempts\n", dns.c_str(), cfg.dns_inflight, cfg.dns_timeout_ms,
                 cfg.dns_attempts);
+    if (cfg.mode == Mode::Real) {
+        // Started here (the engine's later call is a no-op) so the header can
+        // say what the ClientHello really offers: Schannel enables
+        // post-quantum groups machine-wide; --no-pq only removes them.
+        wc::tls::StartupOptions tls_options;
+        tls_options.post_quantum = cfg.post_quantum;
+        const bool tls_ok = wc::tls::startup(tls_options);
+        std::printf("TLS %s; post-quantum key exchange %s, %s\n", tls_ok ? "ready" : "unavailable (https fetches fail)",
+                    cfg.post_quantum ? "requested" : "disabled (--no-pq)",
+                    wc::tls::post_quantum_available() ? "offered" : "not offered");
+    }
     std::fflush(stdout);
 
     Stats stats(cfg.threads);
@@ -118,7 +130,15 @@ int main(int argc, char** argv) {
     info.concurrency = cfg.concurrency;
     info.elapsed_s = reporter.elapsed_s();
     info.peak_inflight = reporter.peak_inflight();
+    if (cfg.mode == Mode::Real) {
+        info.pq_requested = cfg.post_quantum;
+        info.pq_offered = wc::tls::post_quantum_available();
+    }
     std::fputs(format_summary(totals, info).c_str(), stdout);
+    if (!cfg.record_path.empty()) {
+        std::printf("Records: %llu sites written to %s\n", static_cast<unsigned long long>(engine.records_written()),
+                    cfg.record_path.c_str());
+    }
     std::fflush(stdout);
 
     if (!cfg.json_path.empty() && !write_file(cfg.json_path, format_json(totals, info))) {

@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 
@@ -99,6 +100,11 @@ struct RunInfo {
     unsigned concurrency = 0;
     double elapsed_s = 0;
     uint64_t peak_inflight = 0;
+    // Real mode only (unset in classic): post-quantum key exchange requested
+    // (not --no-pq), and whether this process's ClientHello actually offers a
+    // post-quantum group (Schannel enables them machine-wide).
+    std::optional<bool> pq_requested;
+    std::optional<bool> pq_offered;
 };
 
 // "[%3d] %6d Q %7d E %7d H %6d D %6d I %5d R %5d C %5d L %4dK" (no newline).

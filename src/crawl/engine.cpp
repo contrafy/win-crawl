@@ -1,6 +1,8 @@
 #include "crawl/engine.h"
 
 #include "crawl/connection.h"
+#include "crawl/ipranges.h"
+#include "crawl/record.h"
 #include "dns/resolver.h"
 #include "dns/servers.h"
 #include "net/addr.h"
@@ -27,6 +29,10 @@ constexpr unsigned kMaxRobotsRedirects = 5;  // RFC 9309 §2.3.1.2
 constexpr unsigned kMaxPortRetries = 20;
 constexpr uint32_t kPortRetryBaseMs = 50;
 constexpr uint32_t kPortRetryMaxMs = 1000;
+// --record: each loop hands its buffer to the writer thread once it holds
+// this much (~500 records), i.e. one lock round trip per few hundred sites.
+constexpr size_t kRecordFlush = 256 * 1024;
+constexpr size_t kRecordBuffer = kRecordFlush + 64 * 1024;  // a record rarely exceeds 1 KiB
 
 bool ascii_iprefix(std::string_view text, std::string_view prefix) {
     if (text.size() < prefix.size()) {
@@ -85,10 +91,12 @@ public:
     dns::Resolver resolver_;
     parse::LinkExtractor links_;
     bool stopping_ = false;
+    const bool recording_;  // --record
 
     void task_done(Task* task);
     bool new_host(std::string_view host) { return engine_.hosts_.insert(host); }
     bool new_ip(uint32_t ipv4_be) { return engine_.ips_.insert(ipv4_be); }
+    void emit(const SiteRecord& record);
 
 private:
     void start();
@@ -108,6 +116,8 @@ private:
     bool pumping_ = false;
     bool finishing_ = false;
     net::TimerId dns_timer_ = 0;
+    std::string records_;  // serialized records not yet handed to the writer
+    uint64_t record_count_ = 0;
 };
 
 // One URL through the pipeline. Classic and real mode share the skeleton:
@@ -131,6 +141,10 @@ private:
     bool real() const { return w_.cfg_.mode == Mode::Real; }
     void resolve(Phase phase, const std::string& host);
     void on_dns(dns::Status status, uint32_t ipv4_be);
+    void query_https_rr();
+    void on_https_rr(dns::Status status, const dns::HttpsRecord& rr);
+    void note_fetch(const FetchResult& result);
+    void note_tls(const tls::ClientSession& session);
     void on_fetch(Connection& connection, const FetchResult& result) override;
     void count_failure(FetchError error);
     bool retry_later(FetchError error);
@@ -142,6 +156,7 @@ private:
     void fetch_page();
     void on_page(const FetchResult& result);
     void finish();
+    void complete();
 
     void build_request(std::string_view method, const parse::Url& url);
     Endpoint endpoint(const parse::Url& url, uint32_t ipv4_be) const;
@@ -165,6 +180,13 @@ private:
     int last_status_ = 0;
     unsigned port_retries_ = 0;
     net::TimerId retry_timer_ = 0;
+
+    // --record
+    SiteRecord rec_;
+    bool rec_active_ = false;      // this URL's host passed dedupe: emit a record
+    bool https_pending_ = false;   // an HTTPS RR query is outstanding
+    bool done_pending_ = false;    // finished, waiting for the HTTPS RR answer
+    uint64_t start_ms_ = 0;
 };
 
 // ---------------------------------------------------------------- Task
@@ -181,6 +203,7 @@ void Task::start(std::string_view line) {
     page_replied_ = false;
     last_status_ = 0;
     port_retries_ = 0;
+    rec_active_ = false;
 
     if (!parse::parse_url(line, page_) || (!real() && page_.scheme != parse::Scheme::Http)) {
         finish();
@@ -192,6 +215,14 @@ void Task::start(std::string_view line) {
         return;
     }
     st.add(Counter::UniqueHosts);
+    if (w_.recording_) {
+        rec_active_ = true;
+        rec_.clear();
+        rec_.url.assign(line.data(), line.size());
+        rec_.host.assign(page_.host);
+        rec_.seed_https = page_.scheme == parse::Scheme::Https;
+        start_ms_ = w_.loop_.now();
+    }
     resolve(Phase::Dns, page_.host);
 }
 
@@ -207,21 +238,41 @@ void Task::resolve(Phase phase, const std::string& host) {
 void Task::on_dns(dns::Status status, uint32_t ipv4_be) {
     // Resolver::shutdown() fails pending lookups; those are cancellations, not DNS failures.
     if (w_.stopping_) {
+        if (rec_active_ && phase_ == Phase::Dns) {
+            rec_.dns = "cancelled";
+        }
         finish();
         return;
     }
     const bool ok = status == dns::Status::Ok;
     switch (phase_) {
     case Phase::Dns:
+        if (rec_active_) {
+            rec_.dns = dns::status_name(status);
+        }
         if (!ok) {
             w_.stats_.add(Counter::DnsFail);
             finish();
             return;
         }
         w_.stats_.add(Counter::DnsOk);
+        if (rec_active_) {
+            rec_.has_ip = true;
+            rec_.ip = ipv4_be;
+            rec_.cf_ip = cloudflare_ipv4().contains(ipv4_be);
+            if (w_.cfg_.https_rr) {
+                query_https_rr();
+            }
+        }
         if (!w_.new_ip(ipv4_be)) {
+            if (rec_active_) {
+                rec_.ip_dup = true;
+            }
             finish();
             return;
+        }
+        if (rec_active_) {
+            rec_.ip_dup = false;
         }
         w_.stats_.add(Counter::UniqueIps);
         page_ip_ = ipv4_be;
@@ -231,6 +282,9 @@ void Task::on_dns(dns::Status status, uint32_t ipv4_be) {
     case Phase::RobotsDns:
         // A robots.txt redirect to an unresolvable host: unreachable.
         if (!ok) {
+            if (rec_active_ && funnel_) {
+                rec_.robots_error = "redirect_dns";
+            }
             robots_decided(Policy::DisallowAll);
             return;
         }
@@ -239,6 +293,9 @@ void Task::on_dns(dns::Status status, uint32_t ipv4_be) {
         return;
     case Phase::PageDns:
         if (!ok) {
+            if (rec_active_) {
+                rec_.fetch = "redirect_dns";
+            }
             finish();  // the redirect reply already counted as the page's answer
             return;
         }
@@ -299,6 +356,9 @@ void Task::fetch_page() {
 }
 
 void Task::on_fetch(Connection&, const FetchResult& result) {
+    if (rec_active_) {
+        note_fetch(result);
+    }
     if (phase_ == Phase::Robots) {
         on_robots(result);
     } else {
@@ -350,7 +410,13 @@ void Task::on_robots(const FetchResult& result) {
     }
     if (result.error != FetchError::None) {
         count_failure(result.error);
+        if (rec_active_ && funnel_) {
+            rec_.robots_error = fetch_error_name(result.error);
+        }
         if (!real()) {
+            if (rec_active_) {
+                rec_.robots_allowed = false;
+            }
             finish();
             return;
         }
@@ -359,9 +425,16 @@ void Task::on_robots(const FetchResult& result) {
         return;
     }
     const int status = result.status;
+    if (rec_active_ && funnel_) {
+        rec_.robots_status = status;  // overwritten along robots redirects: the last one wins
+    }
     if (!real()) {
         // Assignment semantics: only a 4xx robots reply lets the page through.
-        if (status >= 400 && status < 500) {
+        const bool allowed = status >= 400 && status < 500;
+        if (rec_active_) {
+            rec_.robots_allowed = allowed;
+        }
+        if (allowed) {
             w_.stats_.add(Counter::RobotsPassed);
             fetch_page();
         } else {
@@ -401,6 +474,11 @@ void Task::robots_decided(Policy policy) {
         if (allowed) {
             w_.stats_.add(Counter::RobotsPassed);
         }
+        if (rec_active_) {
+            rec_.robots_allowed = allowed;
+        }
+    } else if (!allowed && rec_active_) {
+        rec_.fetch = "robots_blocked";  // a redirect led to an origin whose robots.txt disallows the page
     }
     if (!allowed) {
         finish();
@@ -415,12 +493,19 @@ void Task::on_page(const FetchResult& result) {
     }
     if (result.error != FetchError::None) {
         count_failure(result.error);
+        if (rec_active_) {
+            rec_.fetch = fetch_error_name(result.error);
+        }
         finish();
         return;
     }
     page_replied_ = true;
     last_status_ = result.status;
     const int status = result.status;
+    if (rec_active_) {
+        rec_.fetch = "ok";
+        rec_.set_page_reply(*result.reply, page_, result.body);
+    }
 
     if (real() && status >= 300 && status < 400 && page_hops_ < w_.cfg_.max_redirects) {
         const std::string_view location = result.reply->header("Location");
@@ -437,6 +522,9 @@ void Task::on_page(const FetchResult& result) {
                 if (allowed) {
                     fetch_page();
                 } else {
+                    if (rec_active_) {
+                        rec_.fetch = "robots_blocked";
+                    }
                     finish();
                 }
             } else if (host) {
@@ -449,7 +537,11 @@ void Task::on_page(const FetchResult& result) {
     }
 
     if (status >= 200 && status < 300 && (!real() || is_html(*result.reply))) {
-        w_.stats_.add(Counter::Links, w_.links_.extract(result.body, page_));
+        const size_t links = w_.links_.extract(result.body, page_);
+        w_.stats_.add(Counter::Links, links);
+        if (rec_active_) {
+            rec_.links = links;
+        }
     }
     finish();
 }
@@ -461,7 +553,86 @@ void Task::finish() {
     }
     phase_ = Phase::Idle;
     conn_.close();  // RST: no TIME_WAIT, the next URL needs a different server anyway
+    if (rec_active_) {
+        rec_.redirects = page_hops_;
+    }
+    if (https_pending_) {
+        done_pending_ = true;  // on_https_rr() completes the task
+        return;
+    }
+    complete();
+}
+
+void Task::complete() {
+    if (rec_active_) {
+        rec_active_ = false;
+        rec_.ms = w_.loop_.now() - start_ms_;
+        w_.emit(rec_);
+    }
     w_.task_done(this);
+}
+
+void Task::query_https_rr() {
+    https_pending_ = true;
+    w_.resolver_.resolve_https(page_.host,
+                               [this](dns::Status status, const dns::HttpsRecord& rr) { on_https_rr(status, rr); });
+}
+
+void Task::on_https_rr(dns::Status status, const dns::HttpsRecord& rr) {
+    https_pending_ = false;
+    SiteRecord::HttpsRr& out = rec_.https_rr;
+    // Resolver::shutdown() fails pending queries as Timeout: a cancellation.
+    out.status = w_.stopping_ && status == dns::Status::Timeout ? "cancelled" : dns::status_name(status);
+    out.present = status == dns::Status::Ok && rr.present;
+    out.alias = out.present && rr.alias_mode;
+    out.h3 = out.present && rr.alpn_h3;
+    out.h2 = out.present && rr.alpn_h2;
+    out.ech = out.present && rr.ech;
+    if (done_pending_) {
+        done_pending_ = false;
+        complete();
+    }
+}
+
+void Task::note_fetch(const FetchResult& result) {
+    if (result.tls != nullptr && rec_.tls.handshake == nullptr) {
+        note_tls(*result.tls);
+    }
+    // The first reply of a task is always the seed origin's robots.txt from
+    // the seed IP, so CF-RAY here pairs with the seed IP's cf_ip.
+    if (result.error == FetchError::None && !rec_.cf_ray) {
+        rec_.cf_ray = result.reply->has_header("CF-RAY");
+    }
+}
+
+void Task::note_tls(const tls::ClientSession& session) {
+    SiteRecord::Tls& t = rec_.tls;
+    t.protocol = session.protocol();
+    if (session.failure() == tls::Failure::Certificate) {
+        t.handshake = "certificate";
+    } else if (t.protocol != 0) {
+        t.handshake = "ok";
+    } else if (session.state() == tls::ClientSession::State::Failed) {
+        t.handshake = "failed";
+    } else {
+        t.handshake = "incomplete";  // the fetch ended (timeout, reset) mid-handshake
+    }
+    if (t.protocol == 0) {
+        return;  // no negotiated parameters to report
+    }
+    const tls::ClientSession::Info info = session.info();  // valid after Failure::Certificate too
+    t.cipher = info.cipher;
+    t.group = info.key_exchange;
+    if (t.group.empty() && info.group != 0) {
+        // A group the TLS module has no name for: keep its code point.
+        static constexpr char kHex[] = "0123456789abcdef";
+        t.group = "0x";
+        for (int shift = 12; shift >= 0; shift -= 4) {
+            t.group.push_back(kHex[(info.group >> shift) & 15]);
+        }
+    }
+    t.pq = info.pq_hybrid;
+    t.resumed = info.resumed;
 }
 
 void Task::abort() {
@@ -524,7 +695,8 @@ Worker::Worker(Engine& engine, size_t index, unsigned slots, unsigned dns_inflig
     : engine_(engine),
       cfg_(engine.config_),
       stats_(engine.stats_.block(index)),
-      resolver_(loop_, resolver_config(engine.config_, dns_inflight, dns_servers)) {
+      resolver_(loop_, resolver_config(engine.config_, dns_inflight, dns_servers)),
+      recording_(engine.records_.is_open()) {
     tasks_.reserve(slots);
     free_.reserve(slots);
     for (unsigned i = 0; i < slots; ++i) {
@@ -619,11 +791,26 @@ void Worker::task_done(Task* task) {
     pump();
 }
 
+void Worker::emit(const SiteRecord& record) {
+    if (records_.capacity() < kRecordBuffer) {
+        records_.reserve(kRecordBuffer);  // a recycled buffer keeps its capacity; a fresh one gets it once
+    }
+    record.append_json(records_);
+    ++record_count_;
+    if (records_.size() >= kRecordFlush) {
+        engine_.records_.submit(records_);
+    }
+}
+
 void Worker::maybe_finish() {
     if (finishing_ || live_ != 0 || !(input_done_ || stopping_)) {
         return;
     }
     finishing_ = true;
+    if (recording_) {
+        engine_.records_.submit(records_);
+        engine_.records_written_.fetch_add(record_count_, std::memory_order_relaxed);
+    }
     resolver_.shutdown();
     if (dns_timer_ != 0) {
         loop_.cancel_timer(dns_timer_);
@@ -703,8 +890,14 @@ bool Engine::run(std::string& error) {
         return false;
     }
     if (config_.mode == Mode::Real) {
-        // Failure is not fatal: https fetches then fail as tls_fail.
-        tls::startup();
+        // Failure is not fatal: https fetches then fail as tls_fail. The
+        // first startup() in the process wins (main may have called it).
+        tls::StartupOptions tls_options;
+        tls_options.post_quantum = config_.post_quantum;
+        tls::startup(tls_options);
+    }
+    if (!config_.record_path.empty() && !records_.open(config_.record_path, error)) {
+        return false;
     }
 
     std::vector<std::thread> threads;
@@ -723,6 +916,10 @@ bool Engine::run(std::string& error) {
     }
     for (auto& t : threads) {
         t.join();
+    }
+    if (records_.is_open() && !records_.close()) {
+        error = "writing the record file " + config_.record_path + " failed";
+        return false;
     }
     return true;
 }

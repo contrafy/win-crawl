@@ -135,6 +135,25 @@ TEST_CASE("config: threads are capped by concurrency") {
     CHECK(cfg.threads == 3);
 }
 
+TEST_CASE("config: --record, --https-rr, --no-pq") {
+    Config cfg;
+    REQUIRE(parse({"u.txt"}, cfg).status == ParseStatus::Ok);
+    CHECK(cfg.record_path.empty());
+    CHECK_FALSE(cfg.https_rr);
+    CHECK(cfg.post_quantum);
+
+    Config set;
+    REQUIRE(parse({"--mode=real", "--record", "r.jsonl", "--https-rr", "--no-pq", "u.txt"}, set).status ==
+            ParseStatus::Ok);
+    CHECK(set.record_path == "r.jsonl");
+    CHECK(set.https_rr);
+    CHECK_FALSE(set.post_quantum);
+
+    CHECK(fails({"--https-rr", "u.txt"}, "--https-rr needs --record"));
+    CHECK(fails({"--record=", "u.txt"}, "--record"));
+    CHECK(fails({"--no-pq=1", "u.txt"}, "takes no value"));
+}
+
 TEST_CASE("config: help") {
     Config cfg;
     CHECK(parse({"-h"}, cfg).status == ParseStatus::Help);
