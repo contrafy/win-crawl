@@ -291,3 +291,33 @@ python tools\study\analyze.py study.jsonl --seeds 1000000 > report.md
 
 If the run must stay well under 45 minutes, `--hosts-per-ip 1000` costs 2.4
 points of coverage and estimates 16–24 minutes.
+
+### What actually happened (2026-11-22)
+
+The recommended run fetched 345,351 of 411,458 resolving hosts (83.9%, every
+Cloudflare host), close to the estimate. The tail was much longer than
+modelled:
+
+| elapsed | sites in flight or waiting |
+|---:|---:|
+| 14 min | 23,209 |
+| 30 min | 4,980 |
+| 45 min | 2,249 |
+| 60 min | 1,565 |
+
+About 98.5% of the work was done by the 30-minute estimate. What remained was
+queued behind the handful of IPs with the most hosts, each limited to 2
+connections. The slowest sites waited up to 40 minutes on their IP's gate
+(`wait_ms` p99 13 min). The run was then cut off by the driving shell's
+60-minute job limit, a hard kill and not Ctrl+C. That left 4,884 hosts
+(0.6%) with no record: sites still queued or in flight, plus records still in
+the writer's buffers. See [`study-2026.md`](study-2026.md).
+
+Two lessons for the next run:
+
+- **The estimator undercounts per-site time on the biggest IPs.** Parking and
+  bulk-hosting IPs redirect over TLS and answer slowly, so per-IP drain is
+  closer to 1 site/s than the modelled 2/1.8 s.
+- **wincrawl needs a `--deadline`** that stops intake and drains gracefully
+  at a wall-clock limit, the same path as Ctrl+C. Every host would then get a
+  record (`skip: "stopped"`). It is on the [roadmap](roadmap.md).
