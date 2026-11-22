@@ -24,6 +24,7 @@ endfunction()
 
 wc_add_fuzzer(dns_response LIBS wc_dns)
 wc_add_fuzzer(dns_https LIBS wc_dns)
+wc_add_fuzzer(record LIBS wc_crawl)
 wc_add_fuzzer(http_response LIBS wc_parse)
 wc_add_fuzzer(url LIBS wc_parse)
 wc_add_fuzzer(robots LIBS wc_parse)
