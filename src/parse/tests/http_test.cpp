@@ -112,6 +112,11 @@ TEST_CASE("append_request writes an HTTP/1.1 request") {
     req.clear();
     wc::parse::append_request(req, "HEAD", u, "", false);
     CHECK(req == "HEAD / HTTP/1.1\r\nHost: x.org\r\nAccept: */*\r\nConnection: close\r\n\r\n");
+    req.clear();
+    wc::parse::append_request(req, "GET", u, "ua", true, "Signature-Input: sig1=()\r\nSignature: sig1=:AA==:\r\n");
+    CHECK(req ==
+          "GET / HTTP/1.1\r\nHost: x.org\r\nUser-Agent: ua\r\nAccept: */*\r\nConnection: keep-alive\r\n"
+          "Signature-Input: sig1=()\r\nSignature: sig1=:AA==:\r\n\r\n");
 }
 
 TEST_CASE("Content-Length body") {
