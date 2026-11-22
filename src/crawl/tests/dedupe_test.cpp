@@ -35,23 +35,11 @@ TEST_CASE("dedupe: host hash separates near-identical names") {
     }
 }
 
-TEST_CASE("dedupe: ip set") {
-    IpSet ips;
-    CHECK(ips.insert(0));
-    CHECK_FALSE(ips.insert(0));
-    CHECK(ips.insert(0x0100007f));
-    CHECK_FALSE(ips.insert(0x0100007f));
-    CHECK(ips.insert(0xffffffff));
-    CHECK(ips.size() == 3);
-}
-
 TEST_CASE("dedupe: concurrent inserts count each key exactly once") {
     HostSet hosts;
-    IpSet ips;
     const int threads = 8;
     const int keys = 50000;  // every thread inserts the same keys
     std::atomic<int> new_hosts{0};
-    std::atomic<int> new_ips{0};
     std::vector<std::thread> workers;
     for (int t = 0; t < threads; ++t) {
         workers.emplace_back([&, t] {
@@ -63,9 +51,6 @@ TEST_CASE("dedupe: concurrent inserts count each key exactly once") {
                 if (hosts.insert(name)) {
                     new_hosts.fetch_add(1);
                 }
-                if (ips.insert(static_cast<uint32_t>(i * 2654435761u))) {
-                    new_ips.fetch_add(1);
-                }
             }
         });
     }
@@ -73,18 +58,16 @@ TEST_CASE("dedupe: concurrent inserts count each key exactly once") {
         w.join();
     }
     CHECK(new_hosts.load() == keys);
-    CHECK(new_ips.load() == keys);
     CHECK(hosts.size() == static_cast<size_t>(keys));
-    CHECK(ips.size() == static_cast<size_t>(keys));
 }
 
 TEST_CASE("dedupe: presized set grows past its expectation") {
-    IpSet ips(16);
-    for (uint32_t i = 0; i < 100000; ++i) {
-        CHECK(ips.insert(i));
+    HostSet hosts(16);
+    for (int i = 0; i < 100000; ++i) {
+        CHECK(hosts.insert("h" + std::to_string(i)));
     }
-    for (uint32_t i = 0; i < 100000; i += 7) {
-        CHECK_FALSE(ips.insert(i));
+    for (int i = 0; i < 100000; i += 7) {
+        CHECK_FALSE(hosts.insert("H" + std::to_string(i)));
     }
-    CHECK(ips.size() == 100000);
+    CHECK(hosts.size() == 100000);
 }

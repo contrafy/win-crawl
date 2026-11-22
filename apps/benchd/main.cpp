@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -65,6 +66,13 @@ const char kUsage[] =
     "  --chunked F              fraction of 200 pages sent chunked (0.1)\n"
     "  --http-delay-ms M[,J]    per-request response delay, M +/- J ms (0)\n"
     "  --idle-timeout-ms MS     reset idle connections after MS (30000)\n"
+    "  --ip-pool N              every host resolves to one of N addresses (h<K> -> 127.0.0.(K%N+1));\n"
+    "                           overrides --ip-share (0 = off)\n"
+    "  --crawl-delay F[,S]      fraction of robots.txt files with Crawl-delay: S (default S 1)\n"
+    "  --throttle F[,S]         fraction of hosts answering their first page request 429 with\n"
+    "                           Retry-After: S (default S 1)\n"
+    "  --track                  record per-IP connection concurrency and per-host request times;\n"
+    "                           printed at exit (costs a mutex per connection and request)\n"
     "  --duration S             exit after S seconds (default: run until Ctrl+C)\n"
     "  --stats-interval MS      periodic stats line period (2000)\n"
     "  --quiet                  no periodic lines\n"
@@ -134,6 +142,23 @@ public:
         if (!parse_delay(v, d)) die(std::string("bad delay for ") + std::string(option) + ": " + v + " (want MEAN[,JITTER])");
         return d;
     }
+    // "F" or "F,S": a fraction in [0, 1] and an optional whole number of seconds.
+    void fraction_with_seconds(std::string_view option, double& fraction, uint32_t& seconds) {
+        const std::string v = value(option);
+        const size_t comma = v.find(',');
+        char* end = nullptr;
+        const double f = std::strtod(v.c_str(), &end);
+        if (end == v.c_str() || f < 0 || f > 1 || (comma == std::string::npos ? *end != '\0' : *end != ',')) {
+            die(std::string("bad value for ") + std::string(option) + ": " + v + " (want F[,SECONDS])");
+        }
+        fraction = f;
+        if (comma != std::string::npos) {
+            const char* s = v.c_str() + comma + 1;
+            const unsigned long long n = std::strtoull(s, &end, 10);
+            if (end == s || *end != '\0') die(std::string("bad seconds for ") + std::string(option) + ": " + v);
+            seconds = static_cast<uint32_t>(n);
+        }
+    }
 
     [[noreturn]] static void die(const std::string& message) {
         std::fprintf(stderr, "wincrawl-benchd: %s\n(see wincrawl-benchd --help)\n", message.c_str());
@@ -152,6 +177,31 @@ std::string win_error(DWORD err) {
     std::string s(buf);
     while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == '.')) s.pop_back();
     return std::to_string(err) + " (" + s + ")";
+}
+
+// --track: what a polite client had to keep within bounds, per destination IP.
+void print_tracking(const HttpServer& http) {
+    const std::vector<IpTrack> ips = http.ip_tracks();
+    uint64_t accepts = 0;
+    uint32_t most_open = 0;
+    double min_gap = -1;
+    size_t spaced = 0;
+    std::map<uint32_t, size_t> by_open;
+    for (const IpTrack& t : ips) {
+        accepts += t.accepts;
+        most_open = std::max(most_open, t.max_open);
+        ++by_open[t.max_open];
+        if (t.min_gap_ms >= 0) {
+            ++spaced;
+            if (min_gap < 0 || t.min_gap_ms < min_gap) min_gap = t.min_gap_ms;
+        }
+    }
+    std::printf("tracking: %zu destination IPs, %llu connections, %zu hosts; most connections open at once to one IP "
+                "%u; shortest gap between two connections to one IP %.1f ms (%zu IPs with 2+)\n",
+                ips.size(), static_cast<unsigned long long>(accepts), http.tracked_hosts(), most_open, min_gap, spaced);
+    std::printf("  IPs by most connections open at once:");
+    for (const auto& [open, count] : by_open) std::printf(" %u:%zu", open, count);
+    std::printf("\n");
 }
 
 int cmd_serve(Args& args) {
@@ -189,6 +239,10 @@ int cmd_serve(Args& args) {
         else if (a == "--chunked") b.chunked = args.fraction(a);
         else if (a == "--http-delay-ms") http_delay = args.delay(a);
         else if (a == "--idle-timeout-ms") http_cfg.idle_timeout_ms = static_cast<uint32_t>(args.integer(a));
+        else if (a == "--ip-pool") b.ip_pool = static_cast<uint32_t>(args.integer(a));
+        else if (a == "--crawl-delay") args.fraction_with_seconds(a, b.crawl_delay, b.crawl_delay_s);
+        else if (a == "--throttle") args.fraction_with_seconds(a, b.throttle, b.retry_after_s);
+        else if (a == "--track") http_cfg.track = true;
         else if (a == "--duration") duration_s = args.integer(a);
         else if (a == "--stats-interval") interval_ms = args.integer(a);
         else if (a == "--quiet") quiet = true;
@@ -291,6 +345,7 @@ int cmd_serve(Args& args) {
                 static_cast<unsigned long long>(d.nodata), static_cast<unsigned long long>(d.nxdomain),
                 static_cast<unsigned long long>(d.refused), static_cast<unsigned long long>(d.errors),
                 benchd::CpuMeter::total_seconds());
+    if (http && http_cfg.track) print_tracking(*http);
     return 0;
 }
 

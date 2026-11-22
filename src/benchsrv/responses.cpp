@@ -101,7 +101,7 @@ const char* reason(uint16_t status) {
         case 301: return "Moved Permanently";
         case 400: return "Bad Request";
         case 404: return "Not Found";
-        case 431: return "Request Header Fields Too Large";
+        case 429: return "Too Many Requests";
         case 501: return "Not Implemented";
         case 503: return "Service Unavailable";
         default: return "Unknown";
@@ -145,11 +145,16 @@ constexpr const char* kHtml = "text/html; charset=utf-8";
 ResponseSet::ResponseSet(const Behavior& behavior, uint16_t link_port) {
     const std::string robots_body =
         "# wincrawl-benchd\nUser-agent: *\nDisallow: /private/\nDisallow: /tmp/\n";
+    const std::string robots_delayed_body = "# wincrawl-benchd\nUser-agent: *\nCrawl-delay: " +
+                                            std::to_string(behavior.crawl_delay_s) +
+                                            "\nDisallow: /private/\nDisallow: /tmp/\n";
+    const std::string retry_after = "Retry-After: " + std::to_string(behavior.retry_after_s) + "\r\n";
     for (uint32_t t = 0; t < kPageTemplates; ++t) bodies_[t] = make_page_body(behavior, t, link_port);
     for (int conn = 0; conn < 2; ++conn) {
         const bool close = conn == 1;
         robots_[0][conn] = make_response(200, "text/plain", robots_body, false, close);
         robots_[1][conn] = make_response(404, kHtml, small_html(404), false, close);
+        robots_delayed_[conn] = make_response(200, "text/plain", robots_delayed_body, false, close);
         for (uint32_t t = 0; t < kPageTemplates; ++t) {
             pages_[t][0][conn] = make_response(200, kHtml, bodies_[t], false, close);
             pages_[t][1][conn] = make_response(200, kHtml, bodies_[t], true, close);
@@ -157,6 +162,7 @@ ResponseSet::ResponseSet(const Behavior& behavior, uint16_t link_port) {
         redirect_[conn] = make_response(301, kHtml, small_html(301), false, close, "Location: /r/1\r\n");
         not_found_[conn] = make_response(404, kHtml, small_html(404), false, close);
         server_error_[conn] = make_response(503, kHtml, small_html(503), false, close, "Retry-After: 120\r\n");
+        throttled_[conn] = make_response(429, kHtml, small_html(429), false, close, retry_after.c_str());
     }
     bad_request_ = make_response(400, kHtml, small_html(400), false, true);
     too_large_ = make_response(431, kHtml, small_html(431), false, true);

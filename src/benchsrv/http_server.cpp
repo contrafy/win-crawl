@@ -6,7 +6,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstring>
+#include <mutex>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace wc::benchsrv {
 
@@ -115,6 +119,110 @@ RequestParse parse_request(const char* data, size_t len, HttpRequest& out) {
 
 // ---------------------------------------------------------------------------
 
+// What a polite crawler must keep within bounds, as the server sees it. One
+// mutex: tracking is for tests and politeness runs, not throughput runs.
+//
+// Concurrency is counted from server-side events that precede the client's
+// own: a connection is open from its accept to the last response the server
+// issued on it. Counting until the server processes the client's close would
+// race: the close (a reset, on one worker thread) and the client's next
+// connection (on the acceptor thread) can be processed in either order.
+class HttpTracker {
+public:
+    explicit HttpTracker(bool track) : track_(track), t0_(std::chrono::steady_clock::now()) {}
+
+    bool enabled() const { return track_; }
+
+    double now_ms() const {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0_).count();
+    }
+
+    // Acceptor thread. Returns the accept time.
+    double accepted(uint32_t ip) {
+        const double t = now_ms();
+        std::lock_guard lock(mutex_);
+        Ip& s = ips_[ip];
+        s.track.ip = ip;
+        if (s.track.accepts > 0) {
+            const double gap = t - s.last_accept;
+            if (s.track.min_gap_ms < 0 || gap < s.track.min_gap_ms) s.track.min_gap_ms = gap;
+        }
+        s.last_accept = t;
+        ++s.track.accepts;
+        return t;
+    }
+
+    // A connection is gone: it was open from `accept_ms` to `last_send_ms`
+    // (its accept time when it never got a response).
+    void closed(uint32_t ip, double accept_ms, double last_send_ms) {
+        std::lock_guard lock(mutex_);
+        ips_[ip].spans.emplace_back(accept_ms, std::max(accept_ms, last_send_ms));
+    }
+
+    void request(uint64_t host, bool robots, uint16_t status) {
+        const double t = now_ms();
+        std::lock_guard lock(mutex_);
+        hosts_[host].push_back(RequestEvent{t, status, robots});
+    }
+
+    // True exactly once per host: its first page request (Behavior::throttle).
+    bool first_page(uint64_t host) {
+        std::lock_guard lock(mutex_);
+        return throttled_.insert(host).second;
+    }
+
+    std::vector<IpTrack> ips() const {
+        std::lock_guard lock(mutex_);
+        std::vector<IpTrack> out;
+        out.reserve(ips_.size());
+        std::vector<std::pair<double, int>> events;
+        for (const auto& [ip, s] : ips_) {
+            IpTrack t = s.track;
+            // Sweep: ends sort before starts at the same instant (no overlap).
+            events.clear();
+            for (const auto& [from, to] : s.spans) {
+                events.emplace_back(from, +1);
+                events.emplace_back(to, -1);
+            }
+            std::sort(events.begin(), events.end());
+            int open = 0;
+            for (const auto& e : events) {
+                open += e.second;
+                t.max_open = std::max(t.max_open, static_cast<uint32_t>(std::max(open, 0)));
+            }
+            out.push_back(t);
+        }
+        return out;
+    }
+
+    std::vector<RequestEvent> requests(uint64_t host) const {
+        std::lock_guard lock(mutex_);
+        const auto it = hosts_.find(host);
+        return it == hosts_.end() ? std::vector<RequestEvent>{} : it->second;
+    }
+
+    size_t host_count() const {
+        std::lock_guard lock(mutex_);
+        return hosts_.size();
+    }
+
+private:
+    struct Ip {
+        IpTrack track;
+        double last_accept = 0;
+        std::vector<std::pair<double, double>> spans;  // closed connections: accept .. last response
+    };
+
+    const bool track_;
+    const std::chrono::steady_clock::time_point t0_;
+    mutable std::mutex mutex_;
+    std::unordered_map<uint32_t, Ip> ips_;
+    std::unordered_map<uint64_t, std::vector<RequestEvent>> hosts_;
+    std::unordered_set<uint64_t> throttled_;
+};
+
+// ---------------------------------------------------------------------------
+
 enum class ConnState : uint8_t { Free, Reading, Delaying, Sending, Closing };
 
 struct Conn final : net::TcpHandler {
@@ -137,13 +245,16 @@ struct Conn final : net::TcpHandler {
     net::TimerId timer = 0;
     uint64_t last_active = 0;
     uint32_t local_ip = 0;
+    double accept_ms = 0;      // tracking: when the acceptor took the connection
+    double last_send_ms = -1;  // tracking: when the last response was issued
     Conn* prev = nullptr;
     Conn* next = nullptr;
 };
 
 class HttpWorker {
 public:
-    HttpWorker(const Behavior& behavior, const HttpServerConfig& config) : behavior_(behavior), config_(config) {}
+    HttpWorker(const Behavior& behavior, const HttpServerConfig& config, HttpTracker& tracker)
+        : behavior_(behavior), config_(config), tracker_(tracker) {}
 
     net::Loop& loop() { return loop_; }
     void set_responses(const ResponseSet* responses) { responses_ = responses; }
@@ -154,11 +265,12 @@ public:
     }
 
     // Loop thread. Takes ownership of an accepted socket.
-    void adopt(SOCKET s, uint32_t local_ip) {
+    void adopt(SOCKET s, uint32_t local_ip, double accept_ms) {
         if (stopping_) {
             const linger lg{1, 0};
             setsockopt(s, SOL_SOCKET, SO_LINGER, reinterpret_cast<const char*>(&lg), sizeof(lg));
             closesocket(s);
+            if (tracker_.enabled()) tracker_.closed(local_ip, accept_ms, accept_ms);
             return;
         }
         Conn* c;
@@ -173,6 +285,7 @@ public:
         setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
         if (c->socket.adopt(s) != 0) {  // adopt() closed the socket
             free_.push_back(c);
+            if (tracker_.enabled()) tracker_.closed(local_ip, accept_ms, accept_ms);
             return;
         }
         c->state = ConnState::Reading;
@@ -180,6 +293,8 @@ public:
         c->req_len = 0;
         c->timer = 0;
         c->local_ip = local_ip;
+        c->accept_ms = accept_ms;
+        c->last_send_ms = -1;
         c->last_active = loop_.now();
         c->prev = nullptr;
         c->next = live_;
@@ -295,9 +410,14 @@ private:
                     n = *ipn;
                 }
                 const std::string_view path = req.target;
-                if (path == "/robots.txt" || path.substr(0, 12) == "/robots.txt?") {
+                const bool robots = path == "/robots.txt" || path.substr(0, 12) == "/robots.txt?";
+                if (robots) {
                     bump(stats_.robots);
-                    resp = &responses_->robots(robots_missing(behavior_, n), conn);
+                    const bool missing = robots_missing(behavior_, n);
+                    resp = !missing && host_crawl_delay(behavior_, n) ? &responses_->robots_delayed(conn)
+                                                                     : &responses_->robots(missing, conn);
+                } else if (behavior_.throttle > 0 && host_throttled(behavior_, n) && tracker_.first_page(n)) {
+                    resp = &responses_->throttled(conn);
                 } else {
                     const PagePlan plan = page_plan(behavior_, n, path);
                     switch (plan.kind) {
@@ -307,6 +427,7 @@ private:
                         case PageKind::ServerError: resp = &responses_->server_error(conn); break;
                     }
                 }
+                if (tracker_.enabled()) tracker_.request(n, robots, resp->status);
                 delay = http_delay_ms(behavior_, n, path);
                 break;
             }
@@ -329,6 +450,7 @@ private:
 
     void send_response(Conn& c) {
         c.state = ConnState::Sending;
+        if (tracker_.enabled()) c.last_send_ms = tracker_.now_ms();  // before the client can see it
         c.socket.send(c.out, c.out_len);
     }
 
@@ -363,6 +485,7 @@ private:
         c.state = ConnState::Free;
         free_.push_back(&c);
         bump(stats_.released);
+        if (tracker_.enabled()) tracker_.closed(c.local_ip, c.accept_ms, c.last_send_ms);
     }
 
     void sweep() {
@@ -388,6 +511,7 @@ private:
 
     const Behavior& behavior_;
     const HttpServerConfig& config_;
+    HttpTracker& tracker_;
     const ResponseSet* responses_ = nullptr;
     net::Loop loop_;
     std::vector<std::unique_ptr<Conn>> all_;
@@ -411,14 +535,24 @@ void Conn::on_recv(net::TcpSocket&, size_t bytes, DWORD error) { worker.on_recv(
 
 class HttpServer::Acceptor {
 public:
-    explicit Acceptor(std::vector<std::unique_ptr<HttpWorker>>& workers)
-        : workers_(workers), listener_(loop_, [this](SOCKET s) { on_accept(s); }) {}
+    Acceptor(std::vector<std::unique_ptr<HttpWorker>>& workers, HttpTracker& tracker)
+        : workers_(workers), tracker_(tracker) {}
 
     net::Loop& loop() { return loop_; }
-    net::TcpListener& listener() { return listener_; }
+
+    // Before the loop runs. Returns 0 or a WinSock error.
+    DWORD listen(const sockaddr_in& local, size_t accept_depth, sockaddr_in& bound) {
+        auto listener = std::make_unique<net::TcpListener>(loop_, [this](SOCKET s) { on_accept(s); });
+        // Plain SOMAXCONN gives ~200 on Windows; crawler connect bursts need far more.
+        const DWORD err = listener->listen(local, SOMAXCONN_HINT(16384), accept_depth);
+        if (err != 0) return err;
+        bound = listener->local_address();
+        listeners_.push_back(std::move(listener));
+        return 0;
+    }
 
     void shutdown_on_loop() {
-        listener_.close();
+        for (auto& l : listeners_) l->close();
         finish_when_drained();
     }
 
@@ -430,12 +564,15 @@ private:
         int len = sizeof(local);
         uint32_t local_ip = 0;
         if (getsockname(s, reinterpret_cast<sockaddr*>(&local), &len) == 0) local_ip = local.sin_addr.s_addr;
+        const double accept_ms = tracker_.enabled() ? tracker_.accepted(local_ip) : 0;
         HttpWorker* w = workers_[next_++ % workers_.size()].get();
-        w->loop().post([w, s, local_ip] { w->adopt(s, local_ip); });
+        w->loop().post([w, s, local_ip, accept_ms] { w->adopt(s, local_ip, accept_ms); });
     }
 
     void finish_when_drained() {
-        if (!listener_.busy()) {
+        bool busy = false;
+        for (const auto& l : listeners_) busy = busy || l->busy();
+        if (!busy) {
             loop_.stop();
             return;
         }
@@ -443,25 +580,39 @@ private:
     }
 
     std::vector<std::unique_ptr<HttpWorker>>& workers_;
+    HttpTracker& tracker_;
     net::Loop loop_;
-    net::TcpListener listener_;
+    std::vector<std::unique_ptr<net::TcpListener>> listeners_;
     size_t next_ = 0;
 };
 
 HttpServer::HttpServer(const Behavior& behavior, const HttpServerConfig& config)
-    : behavior_(behavior), config_(config) {
+    : behavior_(behavior), config_(config), tracker_(std::make_unique<HttpTracker>(config.track)) {
     const uint32_t n = config_.threads == 0 ? 1 : config_.threads;
-    for (uint32_t i = 0; i < n; ++i) workers_.push_back(std::make_unique<HttpWorker>(behavior_, config_));
-    acceptor_ = std::make_unique<Acceptor>(workers_);
+    for (uint32_t i = 0; i < n; ++i) workers_.push_back(std::make_unique<HttpWorker>(behavior_, config_, *tracker_));
+    acceptor_ = std::make_unique<Acceptor>(workers_, *tracker_);
 }
 
 HttpServer::~HttpServer() { stop(); }
 
-DWORD HttpServer::start(const sockaddr_in& local) {
-    // Plain SOMAXCONN gives ~200 on Windows; crawler connect bursts need far more.
-    const DWORD err = acceptor_->listener().listen(local, SOMAXCONN_HINT(16384), config_.accept_depth);
-    if (err != 0) return err;
-    local_ = acceptor_->listener().local_address();
+DWORD HttpServer::start(const sockaddr_in& local) { return start(std::vector<sockaddr_in>{local}); }
+
+DWORD HttpServer::start(const std::vector<sockaddr_in>& locals) {
+    if (locals.empty()) return WSAEINVAL;
+    DWORD late_error = 0;
+    for (size_t i = 0; i < locals.size(); ++i) {
+        sockaddr_in local = locals[i];
+        if (i > 0 && local.sin_port == 0) local.sin_port = local_.sin_port;  // share the first port
+        sockaddr_in bound{};
+        if (const DWORD err = acceptor_->listen(local, config_.accept_depth, bound)) {
+            if (i == 0) return err;
+            // Earlier listeners have accepts outstanding: run the loops so
+            // stop() can drain them, then report the failure.
+            late_error = err;
+            break;
+        }
+        if (i == 0) local_ = bound;
+    }
     responses_ = std::make_unique<ResponseSet>(behavior_, ntohs(local_.sin_port));
     for (auto& w : workers_) {
         w->set_responses(responses_.get());
@@ -470,6 +621,10 @@ DWORD HttpServer::start(const sockaddr_in& local) {
         worker_threads_.emplace_back([wp] { wp->loop().run(); });
     }
     acceptor_thread_ = std::thread([this] { acceptor_->loop().run(); });
+    if (late_error != 0) {
+        stop();
+        return late_error;
+    }
     return 0;
 }
 
@@ -491,5 +646,11 @@ HttpCounters HttpServer::counters() const {
     for (const auto& w : workers_) w->add_counters(c);
     return c;
 }
+
+std::vector<IpTrack> HttpServer::ip_tracks() const { return tracker_->ips(); }
+
+std::vector<RequestEvent> HttpServer::host_requests(uint64_t host) const { return tracker_->requests(host); }
+
+size_t HttpServer::tracked_hosts() const { return tracker_->host_count(); }
 
 }  // namespace wc::benchsrv

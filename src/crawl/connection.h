@@ -102,6 +102,12 @@ public:
     bool busy() const { return active_ || socket_.busy(); }
     // An idle connection is being kept alive.
     bool reusable() const { return keep_open_; }
+    // The next fetch to `endpoint` would go out on the kept-alive connection
+    // instead of opening a new one.
+    bool reuses(const Endpoint& endpoint) const {
+        return keep_open_ && ip_ == endpoint.ipv4_be && port_ == endpoint.port && is_tls_ == endpoint.tls &&
+               server_name_ == endpoint.server_name;
+    }
     // TCP connects started over this object's lifetime (tests, diagnostics).
     uint64_t connects() const { return connects_; }
 

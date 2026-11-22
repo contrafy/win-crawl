@@ -17,6 +17,8 @@ constexpr uint64_t kSaltStatus = 0x7374617475736373ULL;
 constexpr uint64_t kSaltTemplate = 0x74656D706C617465ULL;
 constexpr uint64_t kSaltChunked = 0x6368756E6B656421ULL;
 constexpr uint64_t kSaltHttpDelay = 0x6874747064656C61ULL;
+constexpr uint64_t kSaltCrawlDelay = 0x637261776C64656CULL;
+constexpr uint64_t kSaltThrottle = 0x7468726F74746C65ULL;
 
 constexpr uint64_t kHostSpace = 0xFFFFFEu;  // 127.0.0.1 .. 127.255.255.254
 
@@ -154,6 +156,7 @@ bool host_shares_ip(const Behavior& b, uint64_t n) {
 }
 
 uint32_t host_ip(const Behavior& b, uint64_t n) {
+    if (b.ip_pool != 0) return host_unique_ip(n % b.ip_pool);
     if (!host_shares_ip(b, n)) return host_unique_ip(n);
     // Walk down to an earlier host that owns its address and actually resolves;
     // bounded so a pathological ip_share near 1 stays cheap.
@@ -169,6 +172,10 @@ uint32_t dns_delay_ms(const Behavior& b, uint64_t key) {
 }
 
 bool robots_missing(const Behavior& b, uint64_t n) { return unit(b.seed, n, kSaltRobots) < b.robots_404; }
+
+bool host_crawl_delay(const Behavior& b, uint64_t n) { return unit(b.seed, n, kSaltCrawlDelay) < b.crawl_delay; }
+
+bool host_throttled(const Behavior& b, uint64_t n) { return unit(b.seed, n, kSaltThrottle) < b.throttle; }
 
 PagePlan page_plan(const Behavior& b, uint64_t n, std::string_view target) {
     PagePlan plan;

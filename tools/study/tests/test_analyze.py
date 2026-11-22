@@ -215,5 +215,94 @@ class AnalyzeTest(unittest.TestCase):
         self.assertIn("Not measured (run with `--https-rr`).", text)
 
 
+def fetched_site(host: str, ip: str, version: str, **fields) -> dict:
+    """A host fetched within its IP's budget, reaching TLS `version`."""
+    base = dict(dns="ok", ip=ip, ip_dup=False, cf_ip=False, robots_status=404, robots_allowed=True, fetch="ok",
+                status=200, redirects=0, final_url=f"https://{host}/", https_upgrade=True,
+                tls=tls(version=version, pq=version == "TLS 1.3"), alt_svc_h3=False, hsts=False, cf_ray=False,
+                skip=None, wait_ms=0, crawl_delay=None, crawl_delay_ms=0, retry_after=None, retried=None)
+    base.update(fields)
+    return record(host, **base)
+
+
+# A run with --hosts-per-ip 2: IP 1.1.1.1 has 4 resolving hosts (2 fetched,
+# 2 over the budget), 2.2.2.2 one, 3.3.3.3 three (one refused, two skipped
+# once it counted as unreachable), and the CDN IP 104.16.0.9 two (no budget).
+BUDGET_RECORDS = [
+    fetched_site("a1.test", "1.1.1.1", "TLS 1.3", wait_ms=250, crawl_delay=10, crawl_delay_ms=10000),
+    fetched_site("a2.test", "1.1.1.1", "TLS 1.2", wait_ms=500, retry_after=1, retried=True),
+    record("a3.test", dns="ok", ip="1.1.1.1", ip_dup=True, cf_ip=False, skip="ip_budget", wait_ms=0),
+    record("a4.test", dns="ok", ip="1.1.1.1", ip_dup=True, cf_ip=False, skip="ip_budget", wait_ms=0),
+    fetched_site("b.test", "2.2.2.2", "TLS 1.3", robots_status=200, crawl_delay=0.5),
+    record("c1.test", dns="ok", ip="3.3.3.3", ip_dup=False, cf_ip=False, robots_error="connect_fail",
+           robots_allowed=False, skip=None, wait_ms=0),
+    record("c2.test", dns="ok", ip="3.3.3.3", ip_dup=False, cf_ip=False, skip="ip_unreachable", wait_ms=0),
+    record("c3.test", dns="ok", ip="3.3.3.3", ip_dup=False, cf_ip=False, skip="ip_unreachable", wait_ms=0),
+    fetched_site("d1.test", "104.16.0.9", "TLS 1.3", cf_ip=True, cf_ray=True),
+    fetched_site("d2.test", "104.16.0.9", "TLS 1.3", cf_ip=True, cf_ray=True),
+]
+
+
+class WeightingTest(unittest.TestCase):
+    def setUp(self):
+        self.s = analyze.analyze(BUDGET_RECORDS)
+
+    def test_sampling_and_coverage(self):
+        s = self.s
+        self.assertEqual(s.dns_ok, 10)
+        self.assertEqual(s.fetched, 6)
+        self.assertEqual(s.unique_ips, 4)
+        self.assertEqual(s.ip_dup, 2)
+        self.assertEqual(s.skip, {"ip_budget": 2, "ip_unreachable": 2})
+        self.assertEqual((s.ips["1.1.1.1"].resolving, s.ips["1.1.1.1"].fetched), (4, 2))
+        self.assertEqual((s.ips["3.3.3.3"].resolving, s.ips["3.3.3.3"].fetched), (3, 1))
+        self.assertTrue(s.ips["104.16.0.9"].cf)
+        self.assertFalse(analyze.sampled(BUDGET_RECORDS[2]))
+        self.assertFalse(analyze.sampled(BUDGET_RECORDS[6]))
+        self.assertTrue(analyze.sampled(BUDGET_RECORDS[5]))
+
+    def test_weighted_tls13(self):
+        # Unweighted: 4 of 5 handshakes. Weighted: 1.1.1.1's two hosts count
+        # twice each (4 resolving / 2 fetched): (2*1 + 1 + 2) / (2*2 + 1 + 2).
+        labels = [label for label, _, _ in analyze.FACTS]
+        f = self.s.facts[labels.index("TLS 1.3, of completed handshakes")]
+        self.assertEqual((f.k, f.n), (4, 5))
+        self.assertAlmostEqual(f.share, 5 / 7)
+        self.assertAlmostEqual(f.n_eff, 49 / 11)
+        # Any reply: 3.3.3.3's refused host stands for its 3 resolving hosts.
+        g = self.s.facts[labels.index("any HTTP reply (robots or page), of fetched hosts")]
+        self.assertEqual((g.k, g.n), (5, 6))
+        self.assertAlmostEqual(g.share, (2 * 2 + 1 + 2) / (2 * 2 + 1 + 3 + 2))
+
+    def test_report(self):
+        text = analyze.render(self.s)
+        for fragment in [
+            "| all resolving hosts | 6 / 10 = 60.00%",
+            "| on Cloudflare IPs (published ranges) | 2 / 2 = 100.00%",
+            "| on other IPs | 4 / 8 = 50.00%",
+            "| `ip_budget` | 2 / 10 = 20.00%",
+            "| TLS 1.3, of completed handshakes | 4 / 5 = 80.00% [37.55–96.38] | 71.43% [",
+            "], n_eff 4 |",
+            "the largest carries 4 resolving hosts (2 fetched)",
+            "| resolves, IP skipped after repeated failures (not attempted) | 2 / 10 = 20.00%",
+            "waited on politeness (IP queue and spacing, Crawl-delay, Retry-After): 2 / 6 = 33.33%",
+            "of fetched hosts whose robots.txt answered 2xx: 1 / 1 = 100.00%",
+            "| (0, 1] | 1 / 1 = 100.00%",
+            "429/503 replies with a Retry-After: 1; retried after waiting it out: 1 / 1 = 100.00%",
+        ]:
+            self.assertIn(fragment, text)
+        for line in text.splitlines():
+            if line.startswith("|"):
+                self.assertTrue(line.endswith("|"), line)
+
+    def test_weighted_share_format(self):
+        w = analyze.Weighted(k=1, n=2, wk=1.0, wn=2.0, w2n=2.0)
+        self.assertEqual(analyze.weighted_share(w), "50.00% [9.45–90.55], n_eff 2")
+        self.assertEqual(analyze.weighted_share(analyze.Weighted()), "n/a")
+        self.assertEqual(analyze.crawl_delay_bucket(0), "0")
+        self.assertEqual(analyze.crawl_delay_bucket(30), "(10, 30]")
+        self.assertEqual(analyze.crawl_delay_bucket(120), "> 60")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4,7 +4,11 @@
     python tools/study/analyze.py records.jsonl [--seeds N] [--title TEXT] [--top N]
 
 Every share is printed with its numerator, denominator and a Wilson 95%
-score interval. The record schema is documented in docs/study-method.md.
+score interval. With a per-IP host budget (--hosts-per-ip; 1 is the
+assignment's IP dedupe) hosts on busy IPs are sampled, so the HTTP and TLS
+facts are also reported weighted by inverse sampling probability per IP
+(resolving hosts on the IP / fetched hosts on the IP). The record schema is
+documented in docs/study-method.md, the weighting in docs/politeness.md.
 Standard library only.
 """
 
@@ -94,6 +98,103 @@ def hsts_bucket(max_age: int) -> str:
     return HSTS_BUCKETS[-1][0]
 
 
+# Crawl-delay buckets: (label, inclusive upper bound in seconds).
+CRAWL_DELAY_BUCKETS = [("0", 0), ("(0, 1]", 1), ("(1, 5]", 5), ("(5, 10]", 10), ("(10, 30]", 30),
+                       ("(30, 60]", 60), ("> 60", math.inf)]
+
+
+def crawl_delay_bucket(seconds: float) -> str:
+    for label, bound in CRAWL_DELAY_BUCKETS:
+        if seconds <= bound:
+            return label
+    return CRAWL_DELAY_BUCKETS[-1][0]
+
+
+def sampled(r: dict) -> bool:
+    """The host was fetched: it resolved, was within its IP's host budget and
+    its IP was not skipped as unreachable. These hosts carry the HTTP/TLS
+    facts; the other resolving hosts of an IP are represented through the
+    IP's weight."""
+    return r.get("dns") == "ok" and r.get("ip_dup") is False and r.get("skip") not in ("ip_budget", "ip_unreachable")
+
+
+def _tls_version(r: dict):
+    t = r.get("tls")
+    return t.get("version") if t else None
+
+
+def _pq(r: dict):
+    t = r.get("tls")
+    return t.get("pq") if t else None
+
+
+def _replied_https(r: dict) -> bool:
+    return r.get("status") is not None and (r.get("final_url") or "").lower().startswith("https://")
+
+
+# HTTP/TLS facts of fetched hosts, reported unweighted and IP-weighted:
+# (label, in the denominator?, in the numerator?).
+FACTS = [
+    ("any HTTP reply (robots or page), of fetched hosts",
+     lambda r: True, lambda r: r.get("robots_status") is not None or r.get("status") is not None),
+    ("robots.txt allowed the page, of fetched hosts", lambda r: True, lambda r: r.get("robots_allowed") is True),
+    ("final reply 2xx, of page replies",
+     lambda r: r.get("status") is not None, lambda r: 200 <= r["status"] < 300),
+    ("http seed ends on https, of http seeds with a page reply",
+     lambda r: r.get("status") is not None and not (r.get("url") or "").lower().startswith("https://"),
+     lambda r: r.get("https_upgrade") is True),
+    ("TLS 1.3, of completed handshakes", lambda r: _tls_version(r) is not None, lambda r: _tls_version(r) == "TLS 1.3"),
+    ("PQ hybrid, of TLS 1.3 handshakes",
+     lambda r: _tls_version(r) == "TLS 1.3" and _pq(r) is not None, lambda r: _pq(r) is True),
+    ("PQ hybrid, of completed handshakes",
+     lambda r: _tls_version(r) is not None and _pq(r) is not None, lambda r: _pq(r) is True),
+    ("Alt-Svc h3, of last replies over https", _replied_https, lambda r: r.get("alt_svc_h3") is True),
+    ("HSTS, of last replies over https", _replied_https, lambda r: r.get("hsts") is True),
+    ("CF-RAY on the first reply, of hosts with a reply",
+     lambda r: r.get("cf_ray") is not None, lambda r: r.get("cf_ray") is True),
+]
+
+
+@dataclass
+class IpTally:
+    """One IP: its resolving and fetched hosts and the fact counts of the latter."""
+
+    resolving: int = 0
+    fetched: int = 0
+    cf: bool = False
+    den: list = field(default_factory=lambda: [0] * len(FACTS))
+    num: list = field(default_factory=lambda: [0] * len(FACTS))
+
+
+@dataclass
+class Weighted:
+    """A fact over fetched hosts: plain counts, and IP-weighted sums with the
+    Kish effective sample size of the weighted denominator."""
+
+    k: int = 0
+    n: int = 0
+    wk: float = 0.0
+    wn: float = 0.0
+    w2n: float = 0.0  # sum of squared weights over the denominator
+
+    @property
+    def share(self) -> float:
+        return self.wk / self.wn if self.wn > 0 else 0.0
+
+    @property
+    def n_eff(self) -> float:
+        return self.wn * self.wn / self.w2n if self.w2n > 0 else 0.0
+
+
+def weighted_share(w: Weighted) -> str:
+    """'p% [lo–hi], n_eff N': the weighted share with a Wilson interval on the
+    effective sample size."""
+    if w.wn <= 0:
+        return "n/a"
+    lo, hi = wilson(w.share * w.n_eff, w.n_eff)
+    return f"{100 * w.share:.2f}% [{100 * lo:.2f}–{100 * hi:.2f}], n_eff {w.n_eff:,.0f}"
+
+
 @dataclass
 class Split:
     """Numerator/denominator pairs for one population (e.g. behind Cloudflare)."""
@@ -116,8 +217,10 @@ class Stats:
     seed_https: int = 0
     dns: Counter = field(default_factory=Counter)
     dns_ok: int = 0
-    unique_ips: int = 0
-    ip_dup: int = 0
+    fetched: int = 0     # sampled(): within the per-IP host budget and attempted
+    unique_ips: int = 0  # distinct IPs among fetched hosts
+    ip_dup: int = 0      # over the per-IP host budget (ip_dup true)
+    skip: Counter = field(default_factory=Counter)
     robots_attempted: int = 0
     robots_replied: int = 0
     robots_allowed: int = 0
@@ -180,6 +283,16 @@ class Stats:
     servers_seen: int = 0
     content_type: Counter = field(default_factory=Counter)
     ms: list = field(default_factory=list)
+    # Per-IP sampling (IP-weighted facts, coverage)
+    ips: dict = field(default_factory=dict)  # ip -> IpTally
+    facts: list = field(default_factory=lambda: [Weighted() for _ in FACTS])
+    unweightable: int = 0  # fetched hosts' IPs whose weight is unknown (no IP recorded)
+    # Politeness (records written by builds with docs/politeness.md)
+    wait_ms: list = field(default_factory=list)
+    crawl_delay: Counter = field(default_factory=Counter)
+    crawl_delay_robots: int = 0  # fetched hosts whose robots.txt answered 2xx
+    retry_after: int = 0
+    retried: int = 0
 
 
 def analyze(records: Iterable[dict]) -> Stats:
@@ -193,10 +306,38 @@ def analyze(records: Iterable[dict]) -> Stats:
         s.dns[dns] += 1
         if dns == "ok":
             s.dns_ok += 1
-            if r.get("ip_dup") is False:
-                s.unique_ips += 1
-            elif r.get("ip_dup") is True:
+            if r.get("ip_dup") is True:
                 s.ip_dup += 1
+            ip = r.get("ip")
+            tally = s.ips.get(ip) if ip is not None else None
+            if tally is None and ip is not None:
+                tally = s.ips[ip] = IpTally()
+            if tally is not None:
+                tally.resolving += 1
+                tally.cf = tally.cf or r.get("cf_ip") is True
+            if sampled(r):
+                s.fetched += 1
+                if tally is None:
+                    s.unweightable += 1
+                else:
+                    tally.fetched += 1
+                    for i, (_, in_den, in_num) in enumerate(FACTS):
+                        if in_den(r):
+                            tally.den[i] += 1
+                            if in_num(r):
+                                tally.num[i] += 1
+                if r.get("wait_ms") is not None:
+                    s.wait_ms.append(r["wait_ms"])
+                rs_ = r.get("robots_status")
+                if rs_ is not None and 200 <= rs_ < 300:
+                    s.crawl_delay_robots += 1
+                    if r.get("crawl_delay") is not None:
+                        s.crawl_delay[crawl_delay_bucket(r["crawl_delay"])] += 1
+                if r.get("retry_after") is not None:
+                    s.retry_after += 1
+                    s.retried += r.get("retried") is True
+        if r.get("skip") is not None:
+            s.skip[r["skip"]] += 1
 
         rs, re_ = r.get("robots_status"), r.get("robots_error")
         if rs is not None or re_ is not None or r.get("robots_allowed") is not None:
@@ -330,6 +471,22 @@ def analyze(records: Iterable[dict]) -> Stats:
             s.content_type[ct.split(";")[0].strip().lower() or "(empty)"] += 1
         if r.get("ms") is not None:
             s.ms.append(r["ms"])
+    # Inverse-probability weights: each fetched host stands for its IP's
+    # resolving hosts divided by the IP's fetched hosts.
+    for tally in s.ips.values():
+        if tally.fetched == 0:
+            continue
+        s.unique_ips += 1
+        w = tally.resolving / tally.fetched
+        for i, f in enumerate(s.facts):
+            d = tally.den[i]
+            if d:
+                k = tally.num[i]
+                f.k += k
+                f.n += d
+                f.wk += w * k
+                f.wn += w * d
+                f.w2n += w * w * d
     return s
 
 
@@ -373,6 +530,69 @@ class Md:
         return "\n".join(self.lines).rstrip() + "\n"
 
 
+def render_coverage(md: Md, s: Stats) -> None:
+    """Coverage of resolving hosts, the IP-weighted facts, and politeness."""
+    md.h(2, "Coverage and per-IP sampling")
+    tallies = list(s.ips.values())
+    cf = [t for t in tallies if t.cf]
+    other = [t for t in tallies if not t.cf]
+    shared = [t for t in tallies if t.resolving >= 2]
+    md.table(
+        ["population", "fetched / resolving hosts"],
+        [
+            ["all resolving hosts", share(s.fetched, s.dns_ok)],
+            ["on Cloudflare IPs (published ranges)", share(sum(t.fetched for t in cf), sum(t.resolving for t in cf))],
+            ["on other IPs", share(sum(t.fetched for t in other), sum(t.resolving for t in other))],
+            ["on IPs with 2+ resolving hosts", share(sum(t.fetched for t in shared), sum(t.resolving for t in shared))],
+        ],
+    )
+    biggest = max(tallies, key=lambda t: t.resolving, default=None)
+    uncovered = sum(t.resolving for t in tallies if t.fetched == 0)
+    text = f"{len(tallies):,} IPs resolved, {s.unique_ips:,} with at least one host fetched"
+    if biggest is not None:
+        text += f"; the largest carries {biggest.resolving:,} resolving hosts ({biggest.fetched:,} fetched)"
+    text += f". Resolving hosts on IPs with no host fetched (no weight possible): {uncovered:,}."
+    md.p(text)
+    if s.skip:
+        md.counter_table("skipped by politeness (`skip`)", s.skip, s.dns_ok)
+
+    md.h(2, "HTTP and TLS facts, IP-weighted")
+    md.p(
+        "A per-IP host budget samples hosts on shared IPs. Each fetched host is weighted by its IP's "
+        "resolving hosts / fetched hosts, so every resolving host counts once (inverse-probability "
+        "weighting); intervals use the Kish effective sample size. With one host per IP (the "
+        "assignment's IP dedupe) the unweighted column describes the first host on each IP."
+    )
+    md.table(
+        ["fact", "unweighted", "IP-weighted"],
+        [[label, share(f.k, f.n), weighted_share(f)] for (label, _, _), f in zip(FACTS, s.facts)],
+    )
+    if s.unweightable:
+        md.p(f"({s.unweightable:,} fetched hosts have no IP recorded and are left out of both columns.)")
+
+    if not (s.wait_ms or s.skip or s.crawl_delay or s.retry_after):
+        return
+    md.h(2, "Politeness")
+    waits = sorted(s.wait_ms)
+    if waits:
+        waited = sum(1 for w in waits if w > 0)
+        md.p(f"Fetched hosts that waited on politeness (IP queue and spacing, Crawl-delay, Retry-After): "
+             f"{share(waited, len(waits))}.")
+        md.table(
+            ["wait per fetched host", "p50", "p90", "p99", "max"],
+            [[""] + [f"{percentile(waits, q):,.0f} ms" for q in (0.5, 0.9, 0.99)] + [f"{waits[-1]:,} ms"]],
+        )
+    md.p(f"robots.txt with a Crawl-delay, of fetched hosts whose robots.txt answered 2xx: "
+         f"{share(sum(s.crawl_delay.values()), s.crawl_delay_robots)}.")
+    if s.crawl_delay:
+        md.table(
+            ["Crawl-delay (s)", "share of robots.txt with one"],
+            [[label, share(s.crawl_delay[label], sum(s.crawl_delay.values()))] for label, _ in CRAWL_DELAY_BUCKETS],
+        )
+    md.p(f"429/503 replies with a Retry-After: {s.retry_after:,}; retried after waiting it out: "
+         f"{share(s.retried, s.retry_after)}.")
+
+
 def render(s: Stats, seeds: int | None = None, title: str = "wincrawl measurement report", top: int = 15) -> str:
     md = Md()
     md.h(1, title)
@@ -390,16 +610,19 @@ def render(s: Stats, seeds: int | None = None, title: str = "wincrawl measuremen
         rows.append(["unique hosts", f"{s.records:,}", ""])
     rows += [
         ["DNS ok", f"{s.dns_ok:,}", share(s.dns_ok, s.records)],
-        ["unique IPs (passed IP dedupe)", f"{s.unique_ips:,}", share(s.unique_ips, s.dns_ok)],
-        ["robots.txt attempted", f"{s.robots_attempted:,}", share(s.robots_attempted, s.unique_ips)],
+        ["fetched (within the per-IP host budget)", f"{s.fetched:,}", share(s.fetched, s.dns_ok)],
+        ["robots.txt attempted", f"{s.robots_attempted:,}", share(s.robots_attempted, s.fetched)],
         ["robots.txt allowed the page", f"{s.robots_allowed:,}", share(s.robots_allowed, s.robots_attempted)],
         ["page fetch attempted", f"{s.page_attempted:,}", share(s.page_attempted, s.robots_allowed)],
         ["page reply received", f"{s.page_replied:,}", share(s.page_replied, s.page_attempted)],
         ["final reply 2xx", f"{s.final_2xx:,}", share(s.final_2xx, s.page_replied)],
     ]
     md.table(["stage", "count", "of previous stage"], rows)
+    md.p(f"Distinct IPs among fetched hosts: {s.unique_ips:,}.")
     if s.seed_https:
         md.p(f"Seeds with an https:// URL: {share(s.seed_https, s.records)} of unique hosts.")
+
+    render_coverage(md, s)
 
     md.h(2, "Link rot")
     dead_dns = s.dns["nxdomain"] + s.dns["noanswer"]
@@ -413,13 +636,14 @@ def render(s: Stats, seeds: int | None = None, title: str = "wincrawl measuremen
             ["DNS timeout", share(s.dns["timeout"], s.records)],
             ["resolves, but TCP connect fails (first request)", share(connect, s.records)],
             ["resolves, but first request times out", share(s.robots_error["timeout"], s.records)],
+            ["resolves, IP skipped after repeated failures (not attempted)", share(s.skip["ip_unreachable"], s.records)],
             ["**dead: NXDOMAIN + no A + connect failure**", share(dead_dns + connect, s.records)],
             ["alive: any HTTP reply (robots or page)", share(s.alive, s.records)],
         ],
     )
     md.p(
-        "IP-duplicate hosts are not fetched, so 'alive' is bounded by unique IPs; "
-        f"{share(s.alive, s.unique_ips)} of hosts that passed IP dedupe answered HTTP."
+        "Hosts over their IP's host budget are not fetched, so 'alive' is bounded by fetched hosts; "
+        f"{share(s.alive, s.fetched)} of fetched hosts answered HTTP."
     )
     md.counter_table("DNS status", s.dns, s.records)
 

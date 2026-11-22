@@ -20,14 +20,15 @@
 
 namespace wc::crawl {
 
-// Order matches the --json schema. kInflight is a gauge (set, not added).
+// Order matches the --json schema (new keys are appended before the gauges).
+// Gauges (set, not added) come last and are not in the JSON.
 enum class Counter : uint32_t {
     UrlsRead,          // E: URLs taken from the input
     UrlsParsed,        // URLs that parsed (and match the mode's schemes)
     UniqueHosts,       // H: passed the host-uniqueness check
     DnsOk,             // D
     DnsFail,
-    UniqueIps,         // I
+    UniqueIps,         // I: the first host of each IP
     RobotsAttempted,
     RobotsPassed,      // R: robots allowed the page fetch
     PagesAttempted,
@@ -49,11 +50,30 @@ enum class Counter : uint32_t {
     DnsQueriesSent,    // mirrored from the loop's resolver counters
     DnsRetries,
     DnsTimeouts,
-    Inflight,          // gauge: live URL tasks on the loop
+    // Politeness (docs/politeness.md).
+    IpExtraHosts,      // hosts fetched beyond the first of their IP (--hosts-per-ip)
+    IpBudgetSkips,     // hosts skipped by the per-IP host budget (the IP dedupe at --hosts-per-ip 1)
+    IpUnreachable,     // hosts skipped because their IP stopped answering (--ip-fail-limit)
+    IpBusy,            // redirects given up at an IP that is unreachable or has too many sites waiting
+    CdnHosts,          // hosts fetched from IPs under the CDN limits
+    PoliteWaits,       // waits for an IP: its queue or its connection spacing
+    PoliteWaitMs,      // their total, ms
+    CrawlDelayWaits,   // requests held back by a robots.txt Crawl-delay
+    CrawlDelayMs,      // their total, ms
+    CrawlDelaySkips,   // pages skipped: Crawl-delay above --max-crawl-delay
+    Throttled,         // 429 and 503 replies
+    RetryAfterRetries, // requests repeated after waiting out a Retry-After
+    Inflight,          // gauge: live URL tasks on the loop, politeness waits included
+    PoliteWaiting,     // gauge: of those, sites waiting on politeness
     Count
 };
 
 constexpr size_t kCounterCount = static_cast<size_t>(Counter::Count);
+
+// Gauges are sampled, never summed into the JSON.
+constexpr bool is_gauge(Counter c) {
+    return c == Counter::Inflight || c == Counter::PoliteWaiting;
+}
 
 // JSON key for a counter ("urls_read", ...).
 const char* counter_name(Counter c);
@@ -111,7 +131,8 @@ struct RunInfo {
 // `queued` = URLs not yet taken from the input.
 std::string format_status(const Snapshot& s, double elapsed_s, uint64_t queued);
 // "      *** crawling %.1f pps @ %.1f Mbps" (no newline).
-std::string format_rate(double pps, double mbps);
+// ", N waiting on politeness" is appended when sites wait on per-IP limits.
+std::string format_rate(double pps, double mbps, uint64_t waiting = 0);
 // Course-format summary plus the engine's extra counters; ends with '\n'.
 std::string format_summary(const Snapshot& s, const RunInfo& info);
 // Flat JSON object per the shared schema; ends with '\n'.

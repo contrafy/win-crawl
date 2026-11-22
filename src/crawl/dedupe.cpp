@@ -168,10 +168,4 @@ bool HostSet::insert(std::string_view host) {
     return set_.insert(host_hash(host));
 }
 
-bool IpSet::insert(uint32_t ipv4_be) {
-    // +1 keeps 0.0.0.0 away from fmix64's fixed point at 0 (not required for
-    // correctness, just keeps the common path off the zero-key branch).
-    return set_.insert(fmix64(static_cast<uint64_t>(ipv4_be) + 1));
-}
-
 }  // namespace wc::crawl

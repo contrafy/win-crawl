@@ -125,7 +125,8 @@ TEST_CASE("record: an unreached site serializes with nulls") {
           R"("https_rr":null,"robots_status":null,"robots_error":null,"robots_allowed":null,"fetch":null,)"
           R"("status":null,"redirects":null,"final_url":null,"https_upgrade":null,"tls":null,"alt_svc_h3":null,)"
           R"("hsts":null,"hsts_max_age":null,"hsts_sub":null,"hsts_preload":null,"server":null,"cf_ray":null,)"
-          R"("content_type":null,"bytes":null,"links":null,"ms":12})"
+          R"("content_type":null,"bytes":null,"links":null,"ms":12,"skip":null,"wait_ms":0,"crawl_delay":null,)"
+          R"("crawl_delay_ms":0,"retry_after":null,"retried":null})"
           "\n");
 }
 
@@ -154,6 +155,12 @@ TEST_CASE("record: a fetched https site serializes every field") {
     r.tls.pq = true;
     r.tls.resumed = false;
     r.ms = 345;
+    r.skip = "crawl_delay";
+    r.wait_ms = 1500;
+    r.crawl_delay = 0.5;
+    r.crawl_delay_ms = 500;
+    r.retry_after = 1;
+    r.retried = true;
 
     std::string reply =
         "HTTP/1.1 200 OK\r\nServer: cloud\"flare\r\nContent-Type: text/html; charset=utf-8\r\n"
@@ -176,7 +183,8 @@ TEST_CASE("record: a fetched https site serializes every field") {
           R"("tls":{"handshake":"ok","version":"TLS 1.3","cipher":"TLS_AES_128_GCM_SHA256","group":"X25519MLKEM768",)"
           R"("pq":true,"resumed":false},"alt_svc_h3":true,"hsts":true,"hsts_max_age":31536000,"hsts_sub":true,)"
           R"("hsts_preload":false,"server":"cloud\"flare","cf_ray":true,"content_type":"text/html; charset=utf-8",)"
-          R"("bytes":5,"links":7,"ms":345})"
+          R"("bytes":5,"links":7,"ms":345,"skip":"crawl_delay","wait_ms":1500,"crawl_delay":0.5,"crawl_delay_ms":500,)"
+          R"("retry_after":1,"retried":true})"
           "\n");
 }
 
@@ -208,12 +216,20 @@ TEST_CASE("record: page reply fields follow the last reply; clear() resets") {
     CHECK_FALSE(r.has_content_type);
     CHECK(r.final_url == "http://b.test/");
 
+    r.skip = "ip_budget";
+    r.wait_ms = 7;
+    r.crawl_delay = 2;
+    r.crawl_delay_ms = 3;
+    r.retry_after = 4;
+    r.retried = false;
     r.clear();
     std::string out;
     r.append_json(out);
     CHECK(out.find("\"status\":null") != std::string::npos);
     CHECK(out.find("\"final_url\":null") != std::string::npos);
     CHECK(out.find("\"server\":null") != std::string::npos);
+    CHECK(out.find("\"skip\":null,\"wait_ms\":0,\"crawl_delay\":null,\"crawl_delay_ms\":0,\"retry_after\":null,"
+                   "\"retried\":null}") != std::string::npos);
 }
 
 TEST_CASE("record: IPv4 range sets") {
