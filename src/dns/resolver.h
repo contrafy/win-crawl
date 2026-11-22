@@ -5,8 +5,8 @@
 // Every method is loop-thread only, including construction. Callbacks always
 // run later on the loop thread, never inside resolve()/resolve_https(). No
 // TCP fallback: a truncated (TC) reply resolves as NoAnswer. Queries carry an
-// EDNS0 OPT record (kEdnsUdpSize); a FORMERR reply makes the remaining
-// attempts of that query go out without it (RFC 6891 section 7).
+// EDNS0 OPT record (ResolverConfig::edns_udp_size); a FORMERR reply makes the
+// remaining attempts of that query go out without it (RFC 6891 section 7).
 //
 // Lifetime: call shutdown(), keep running the loop until busy() is false, then
 // destroy. Callbacks must not destroy the Resolver.
@@ -63,6 +63,7 @@ struct ResolverConfig {
     uint32_t timeout_ms = 1500;        // per attempt
     uint32_t attempts = 3;             // total sends per query, rotating servers
     uint32_t max_inflight = 512;       // further requests wait in a FIFO; clamped to [1, 32768]
+    uint16_t edns_udp_size = kEdnsUdpSize;  // advertised in an OPT record; 0 = plain RFC 1035 queries
 };
 
 class Resolver final : private net::UdpHandler {

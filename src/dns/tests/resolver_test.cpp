@@ -672,6 +672,21 @@ TEST_CASE("resolver: FORMERR turns EDNS off for the remaining attempts") {
     CHECK(failed.status == Status::ServFail);
     once.shutdown();
     REQUIRE(run_until(loop, [&] { return !once.busy(); }));
+
+    // EDNS configured off: plain queries from the first attempt.
+    dns::ResolverConfig plain_config = config_for({&server}, 300, 1);
+    plain_config.edns_udp_size = 0;
+    dns::Resolver plain(loop, plain_config);
+    Result direct;
+    const size_t before = server.seen.size();
+    plain.resolve("formerr.test", into(direct));
+    REQUIRE(run_until(loop, [&] { return direct.done; }));
+    CHECK(direct.status == Status::Ok);
+    REQUIRE(server.seen.size() == before + 1);
+    CHECK_FALSE(server.seen.back().edns);
+    CHECK(plain.counters().edns_fallbacks == 0);
+    plain.shutdown();
+    REQUIRE(run_until(loop, [&] { return !plain.busy(); }));
     teardown(loop, resolver, {&server});
 }
 

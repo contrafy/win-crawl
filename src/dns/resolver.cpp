@@ -71,6 +71,12 @@ Resolver::Resolver(net::Loop& loop, ResolverConfig config)
     if (config_.servers.empty()) config_.servers = system_dns_servers();
     config_.attempts = std::max<uint32_t>(config_.attempts, 1);
     config_.max_inflight = std::clamp<uint32_t>(config_.max_inflight, 1, kMaxInflightCap);
+    // RFC 6891 treats sizes below 512 as 512; above the receive buffer, the
+    // socket would drop the very replies the size invites.
+    if (config_.edns_udp_size != 0) {
+        config_.edns_udp_size = std::clamp<uint16_t>(config_.edns_udp_size, 512,
+                                                     static_cast<uint16_t>(net::UdpSocket::kRecvBufferSize));
+    }
 
     slots_.resize(config_.max_inflight);
     free_slots_.reserve(config_.max_inflight);
@@ -161,7 +167,7 @@ void Resolver::start(Pending&& request) {
     slot.qtype = request.qtype;
     slot.txid = txid;
     slot.attempt = 0;
-    slot.edns = true;
+    slot.edns = config_.edns_udp_size != 0;
     // Spread first attempts across servers; retries rotate from there.
     slot.server = next_server_;
     next_server_ = (next_server_ + 1) % static_cast<uint32_t>(config_.servers.size());
@@ -173,7 +179,7 @@ void Resolver::send_attempt(uint32_t index) {
     Slot& slot = slots_[index];
     uint8_t packet[kMaxQuerySize];
     const size_t len =
-        build_query(slot.txid, slot.host, slot.qtype, packet, sizeof packet, slot.edns ? kEdnsUdpSize : 0);
+        build_query(slot.txid, slot.host, slot.qtype, packet, sizeof packet, slot.edns ? config_.edns_udp_size : 0);
     // A failed send is left to the attempt timer, which retries on the next server.
     if (socket_.send_to(config_.servers[slot.server], reinterpret_cast<const char*>(packet), len)) {
         ++counters_.queries_sent;
