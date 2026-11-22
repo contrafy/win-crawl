@@ -81,23 +81,46 @@ bool server_identity_ready() {
     return identity().ok;
 }
 
+// Shared so a second server can resume sessions the first one issued.
+struct Credential {
+    CredHandle handle{};
+    bool valid = false;
+    ~Credential() {
+        if (valid)
+            FreeCredentialsHandle(&handle);
+    }
+};
+
 struct Server::Impl {
-    CredHandle cred{};
+    std::shared_ptr<Credential> cred;
     CtxtHandle ctx{};
-    bool has_cred = false;
     bool has_ctx = false;
     SecPkgContext_StreamSizes sizes{};
 };
 
-Server::Server(ServerProto proto) : impl_(std::make_unique<Impl>()) {
+Server::Server(ServerProto proto, const ServerOptions& options) : impl_(std::make_unique<Impl>()) {
     Identity& id = identity();
     if (!id.ok) {
         failed_ = true;
         return;
     }
+    if (options.share_credential_with != nullptr) {
+        impl_->cred = options.share_credential_with->impl_->cred;
+        failed_ = impl_->cred == nullptr;
+        return;
+    }
+    std::vector<CRYPTO_SETTINGS> disabled(options.disabled_key_exchange.size());
+    for (size_t i = 0; i < disabled.size(); ++i) {
+        const std::wstring& name = options.disabled_key_exchange[i];
+        const auto bytes = static_cast<USHORT>(name.size() * sizeof(wchar_t));
+        disabled[i].eAlgorithmUsage = TlsParametersCngAlgUsageKeyExchange;
+        disabled[i].strCngAlgId = {bytes, bytes, const_cast<PWSTR>(name.c_str())};
+    }
     TLS_PARAMETERS params{};
     const DWORD enabled = proto == ServerProto::Tls13 ? SP_PROT_TLS1_3_SERVER : SP_PROT_TLS1_2_SERVER;
     params.grbitDisabledProtocols = ~enabled;
+    params.cDisabledCrypto = static_cast<DWORD>(disabled.size());
+    params.pDisabledCrypto = disabled.empty() ? nullptr : disabled.data();
     SCH_CREDENTIALS creds{};
     creds.dwVersion = SCH_CREDENTIALS_VERSION;
     creds.cCreds = 1;
@@ -105,17 +128,18 @@ Server::Server(ServerProto proto) : impl_(std::make_unique<Impl>()) {
     creds.cTlsParameters = 1;
     creds.pTlsParameters = &params;
     TimeStamp expiry{};
+    auto cred = std::make_shared<Credential>();
     status_ = AcquireCredentialsHandleA(nullptr, const_cast<char*>(UNISP_NAME_A), SECPKG_CRED_INBOUND, nullptr,
-                                        &creds, nullptr, nullptr, &impl_->cred, &expiry);
-    impl_->has_cred = status_ == SEC_E_OK;
-    failed_ = !impl_->has_cred;
+                                        &creds, nullptr, nullptr, &cred->handle, &expiry);
+    cred->valid = status_ == SEC_E_OK;
+    if (cred->valid)
+        impl_->cred = std::move(cred);
+    failed_ = impl_->cred == nullptr;
 }
 
 Server::~Server() {
     if (impl_->has_ctx)
         DeleteSecurityContext(&impl_->ctx);
-    if (impl_->has_cred)
-        FreeCredentialsHandle(&impl_->cred);
 }
 
 bool Server::feed(const char* data, size_t len, std::vector<char>& wire_out, std::vector<char>& plain_out) {
@@ -129,9 +153,9 @@ bool Server::feed(const char* data, size_t len, std::vector<char>& wire_out, std
             SecBuffer out_buf{0, SECBUFFER_TOKEN, nullptr};
             SecBufferDesc out_desc{SECBUFFER_VERSION, 1, &out_buf};
             ULONG attrs = 0;
-            SECURITY_STATUS st = AcceptSecurityContext(&impl_->cred, impl_->has_ctx ? &impl_->ctx : nullptr,
-                                                       &in_desc, kAscFlags, 0, &impl_->ctx, &out_desc, &attrs,
-                                                       nullptr);
+            SECURITY_STATUS st =
+                AcceptSecurityContext(&impl_->cred->handle, impl_->has_ctx ? &impl_->ctx : nullptr, &in_desc,
+                                      kAscFlags, 0, &impl_->ctx, &out_desc, &attrs, nullptr);
             status_ = st;
             drain(out_buf, wire_out);
             if (st == SEC_E_INCOMPLETE_MESSAGE)
@@ -210,8 +234,8 @@ bool Server::shutdown(std::vector<char>& wire_out) {
     SecBuffer out_buf{0, SECBUFFER_TOKEN, nullptr};
     SecBufferDesc out_desc{SECBUFFER_VERSION, 1, &out_buf};
     ULONG attrs = 0;
-    status_ = AcceptSecurityContext(&impl_->cred, &impl_->ctx, nullptr, kAscFlags, 0, nullptr, &out_desc, &attrs,
-                                    nullptr);
+    status_ = AcceptSecurityContext(&impl_->cred->handle, &impl_->ctx, nullptr, kAscFlags, 0, nullptr, &out_desc,
+                                    &attrs, nullptr);
     drain(out_buf, wire_out);
     return status_ == SEC_E_OK || status_ == SEC_I_CONTINUE_NEEDED;
 }
