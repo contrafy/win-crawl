@@ -27,6 +27,8 @@ $ErrorActionPreference = "Continue"
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
+# `-File` passes "a,b" as one string; accept both forms.
+$Targets = @($Targets | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
 if ($Targets.Count -eq 0) {
     $Targets = Get-ChildItem -Directory "fuzz/corpus" | ForEach-Object { $_.Name } | Sort-Object
 }
