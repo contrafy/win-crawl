@@ -54,7 +54,7 @@ TEST_CASE("stats: summary keeps the original wording") {
     s[Counter::HttpOther] = 1;
     s[Counter::DnsOk] = 600;
     s[Counter::DnsFail] = 200;
-    RunInfo info{"classic", 8, 4000, 10.0, 321};
+    RunInfo info{"classic", 8, 4000, 10.0, 321, std::nullopt, std::nullopt};
     const std::string text = format_summary(s, info);
     CHECK(text.find("Extracted 1000 URLs @ 100/s\n") == 0);
     CHECK(text.find("Looked up 800 DNS names @ 80/s\n") != std::string::npos);
@@ -64,6 +64,12 @@ TEST_CASE("stats: summary keeps the original wording") {
     CHECK(text.find("HTTP codes: 2xx = 150, 3xx = 30, 4xx = 15, 5xx = 4, other = 1\n") != std::string::npos);
     CHECK(text.find("75.0% success") != std::string::npos);
     CHECK(text.find("Peak in-flight 321") != std::string::npos);
+    CHECK(text.find("Post-quantum") == std::string::npos);  // classic: no TLS
+
+    info.pq_requested = false;
+    info.pq_offered = false;
+    CHECK(format_summary(s, info).find("Post-quantum key exchange: disabled (--no-pq), not offered in the "
+                                       "ClientHello\n") != std::string::npos);
 }
 
 TEST_CASE("stats: json carries every schema key in order") {
@@ -71,12 +77,16 @@ TEST_CASE("stats: json carries every schema key in order") {
     s[Counter::UrlsRead] = 42;
     s[Counter::DnsTimeouts] = 3;
     s[Counter::Inflight] = 9;  // gauge, not part of the schema
-    RunInfo info{"real", 2, 100, 1.5, 77};
+    RunInfo info{"real", 2, 100, 1.5, 77, true, true};
     const std::string json = format_json(s, info);
     CHECK(json.front() == '{');
     CHECK(json.substr(json.size() - 2) == "}\n");
     CHECK(json.find("\"mode\":\"real\",\"threads\":2,\"concurrency\":100,\"elapsed_s\":1.500,\"urls_read\":42,") == 1);
-    CHECK(json.find("\"dns_timeouts\":3,\"peak_inflight\":77}") != std::string::npos);
+    CHECK(json.find("\"dns_timeouts\":3,\"peak_inflight\":77,\"pq_requested\":true,\"pq_offered\":true}") !=
+          std::string::npos);
+    info.pq_requested.reset();
+    info.pq_offered.reset();
+    CHECK(format_json(s, info).find("\"pq_requested\":null,\"pq_offered\":null}") != std::string::npos);
     CHECK(json.find("inflight\":9") == std::string::npos);
     size_t prev = 0;
     for (const char* key :
@@ -84,7 +94,7 @@ TEST_CASE("stats: json carries every schema key in order") {
           "dns_fail", "unique_ips", "robots_attempted", "robots_passed", "pages_attempted", "pages_ok", "http_2xx",
           "http_3xx", "http_4xx", "http_5xx", "http_other", "links", "bytes_received", "connect_fail", "timeouts",
           "tls_fail", "tls_cert_fail", "port_exhaustion", "other_fail", "redirects_followed", "dns_queries_sent",
-          "dns_retries", "dns_timeouts", "peak_inflight"}) {
+          "dns_retries", "dns_timeouts", "peak_inflight", "pq_requested", "pq_offered"}) {
         const size_t at = json.find("\"" + std::string(key) + "\":");
         CHECK_MESSAGE(at != std::string::npos, key);
         CHECK_MESSAGE(at >= prev, key);

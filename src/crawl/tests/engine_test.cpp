@@ -3,7 +3,11 @@
 #include "crawl/tests/fake_servers.h"
 #include "doctest/doctest.h"
 
+#include <windows.h>
+
 #include <chrono>
+#include <fstream>
+#include <map>
 #include <string>
 #include <thread>
 
@@ -270,4 +274,149 @@ TEST_CASE("engine: request_stop aborts in-flight work promptly") {
     CHECK(s[Counter::RobotsAttempted] == 12);
     CHECK(s[Counter::PagesOk] == 0);
     CHECK(s[Counter::Inflight] == 0);
+}
+
+namespace {
+
+std::string temp_record_path() {
+    char dir[MAX_PATH];
+    REQUIRE(GetTempPathA(MAX_PATH, dir) != 0);
+    return std::string(dir) + "wc_engine_record_" + std::to_string(GetCurrentProcessId()) + ".jsonl";
+}
+
+// Record lines keyed by their "host" value.
+std::map<std::string, std::string> read_records(const std::string& path) {
+    std::map<std::string, std::string> by_host;
+    std::ifstream in(path, std::ios::binary);
+    std::string line;
+    while (std::getline(in, line)) {
+        CHECK(line.front() == '{');
+        CHECK(line.back() == '}');
+        const std::string key = "\"host\":\"";
+        const size_t at = line.find(key);
+        REQUIRE(at != std::string::npos);
+        const size_t end = line.find('"', at + key.size());
+        by_host[line.substr(at + key.size(), end - at - key.size())] = line;
+    }
+    return by_host;
+}
+
+bool has(const std::string& line, const std::string& fragment) {
+    return line.find(fragment) != std::string::npos;
+}
+
+}  // namespace
+
+TEST_CASE("engine: real mode --record writes one line per unique host") {
+    ServerThread srv;
+    FakeDns dns(srv);
+    FakeHttp http(srv);
+    const uint16_t p1 = http.listen(loopback_ip(81));
+    const uint16_t p3 = http.listen(loopback_ip(83));
+    const uint16_t p4 = http.listen(loopback_ip(84));
+    const uint16_t p6 = http.listen(loopback_ip(86));
+    dns.add("s1.test", loopback_ip(81));
+    dns.add("s2.test", loopback_ip(81));  // same IP as s1.test
+    dns.add("s3.test", loopback_ip(83));
+    dns.add("s4.test", loopback_ip(84));
+    dns.add("s6.test", loopback_ip(85));  // nothing listens there
+    // HTTPS RR for s1.test: priority 1, target ".", alpn h3,h2, ech (a
+    // length-prefixed ECHConfigList, contents opaque).
+    dns.add_https("s1.test", std::string("\x00\x01\x00"
+                                         "\x00\x01\x00\x06\x02h3\x02h2"
+                                         "\x00\x05\x00\x06\x00\x04\xde\xad\xbe\xef",
+                                         23));
+    const uint16_t dns_port = dns.start();
+
+    http.route("s1.test", "/robots.txt", Route{reply(404, "", "CF-RAY: 8f00-DFW\r\n")});
+    http.route("s1.test", "/",
+               Route{reply(200, "<a href=/1>1</a><a href=/2>2</a>",
+                           "Content-Type: text/html\r\nServer: fake/1.0 \"q\"\r\nAlt-Svc: h3=\":443\"; ma=60\r\n"
+                           "Strict-Transport-Security: max-age=60\r\n")});
+    http.route("s3.test", "/robots.txt", Route{reply(200, "User-agent: *\nDisallow: /\n")});
+    const std::string gone = "http://gone.test:" + std::to_string(p4) + "/";
+    http.route("s4.test", "/robots.txt", Route{reply(404, "")});
+    http.route("s4.test", "/", Route{reply(301, "", "Location: " + gone + "\r\n")});
+
+    std::string urls;
+    urls += url("s1.test", p1);
+    urls += url("S1.test", p1, "/dup");  // duplicate host: no record
+    urls += url("s2.test", p1);
+    urls += url("nx.test", p1);
+    urls += url("s3.test", p3);
+    urls += url("s4.test", p4);
+    urls += url("s6.test", p6);
+    urls += "not a url\n";  // never reaches host dedupe: no record
+
+    const std::string path = temp_record_path();
+    Config cfg = base_config(dns_port);
+    cfg.mode = Mode::Real;
+    cfg.robots_limit = kRealRobotsLimit;
+    cfg.record_path = path;
+    cfg.https_rr = true;
+    UrlInput input;
+    input.assign(urls);
+    Stats stats(cfg.threads);
+    {
+        Engine engine(cfg, input, stats);
+        std::string error;
+        REQUIRE(engine.run(error));
+        CHECK(engine.records_written() == 6);
+    }
+    const Snapshot s = stats.snapshot();
+    CHECK(s[Counter::UniqueHosts] == 6);
+
+    const auto rec = read_records(path);
+    REQUIRE(rec.size() == 6);
+    for (const auto& [host, line] : rec) {
+        CAPTURE(line);
+        CHECK(has(line, "\"tls\":null"));  // plain http only
+        CHECK(has(line, "\"ms\":"));
+    }
+
+    const std::string& s1 = rec.at("s1.test");
+    CAPTURE(s1);
+    CHECK(has(s1, "{\"url\":\"http://s1.test:" + std::to_string(p1) + "/\""));
+    CHECK(has(s1, "\"dns\":\"ok\",\"ip\":\"127.0.0.81\",\"ip_dup\":false,\"cf_ip\":false"));
+    CHECK(has(s1, "\"https_rr\":{\"status\":\"ok\",\"present\":true,\"alias\":false,\"h3\":true,\"h2\":true,"
+                  "\"ech\":true}"));
+    CHECK(has(s1, "\"robots_status\":404,\"robots_error\":null,\"robots_allowed\":true"));
+    CHECK(has(s1, "\"fetch\":\"ok\",\"status\":200,\"redirects\":0"));
+    CHECK(has(s1, "\"https_upgrade\":false"));
+    CHECK(has(s1, "\"alt_svc_h3\":true"));
+    CHECK(has(s1, "\"hsts\":null"));  // HSTS over plain http does not count
+    CHECK(has(s1, "\"server\":\"fake/1.0 \\\"q\\\"\""));
+    CHECK(has(s1, "\"cf_ray\":true"));
+    CHECK(has(s1, "\"content_type\":\"text/html\""));
+    CHECK(has(s1, "\"links\":2"));
+
+    const std::string& s2 = rec.at("s2.test");
+    CAPTURE(s2);
+    CHECK(has(s2, "\"dns\":\"ok\",\"ip\":\"127.0.0.81\",\"ip_dup\":true"));
+    CHECK(has(s2, "\"https_rr\":{\"status\":\"noanswer\",\"present\":false"));
+    CHECK(has(s2, "\"robots_status\":null"));
+    CHECK(has(s2, "\"fetch\":null"));
+
+    const std::string& nx = rec.at("nx.test");
+    CAPTURE(nx);
+    CHECK(has(nx, "\"dns\":\"nxdomain\",\"ip\":null,\"ip_dup\":null,\"cf_ip\":null,\"https_rr\":null"));
+    CHECK(has(nx, "\"fetch\":null,\"status\":null,\"redirects\":null"));
+
+    const std::string& s3 = rec.at("s3.test");
+    CAPTURE(s3);
+    CHECK(has(s3, "\"robots_status\":200,\"robots_error\":null,\"robots_allowed\":false,\"fetch\":null"));
+    CHECK(has(s3, "\"cf_ray\":false"));
+
+    const std::string& s4 = rec.at("s4.test");
+    CAPTURE(s4);
+    CHECK(has(s4, "\"fetch\":\"redirect_dns\",\"status\":301,\"redirects\":1"));
+    CHECK(has(s4, "\"final_url\":\"http://s4.test:" + std::to_string(p4) + "/\""));
+    CHECK(has(s4, "\"links\":null"));
+
+    const std::string& s6 = rec.at("s6.test");
+    CAPTURE(s6);
+    CHECK(has(s6, "\"robots_status\":null,\"robots_error\":\"connect_fail\",\"robots_allowed\":false"));
+    CHECK(has(s6, "\"cf_ray\":null"));
+
+    DeleteFileA(path.c_str());
 }

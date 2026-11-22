@@ -2,7 +2,10 @@
 
 #include "tls/sspi_include.h"
 
+#include <atomic>
 #include <cstring>
+#include <cwchar>
+#include <iterator>
 #include <mutex>
 
 namespace wc::tls {
@@ -18,16 +21,162 @@ constexpr size_t kRecordHeader = 5;
 struct Globals {
     CredHandle cred{};
     HCERTCHAINENGINE engine = nullptr;
-    bool ok = false;
+    // Published with release order so post_quantum_available() may be called from
+    // threads that did not call startup() themselves.
+    std::atomic<bool> ok{false};
+    bool pq_offered = false;
 };
 
 Globals g;
 std::once_flag g_once;
 
-void init_globals() {
+struct GroupInfo {
+    uint16_t id;
+    const char* name;  // IANA TLS Supported Groups registry name
+    bool pq;           // has a post-quantum KEM component
+    bool hybrid;       // ... combined with classical ECDH
+};
+
+constexpr GroupInfo kGroups[] = {
+    {0x0017, "secp256r1", false, false},
+    {0x0018, "secp384r1", false, false},
+    {0x0019, "secp521r1", false, false},
+    {0x001a, "brainpoolP256r1", false, false},
+    {0x001b, "brainpoolP384r1", false, false},
+    {0x001c, "brainpoolP512r1", false, false},
+    {0x001d, "x25519", false, false},
+    {0x001e, "x448", false, false},
+    {0x0100, "ffdhe2048", false, false},
+    {0x0101, "ffdhe3072", false, false},
+    {0x0102, "ffdhe4096", false, false},
+    {0x0103, "ffdhe6144", false, false},
+    {0x0104, "ffdhe8192", false, false},
+    {0x0200, "MLKEM512", true, false},
+    {0x0201, "MLKEM768", true, false},
+    {0x0202, "MLKEM1024", true, false},
+    {0x11eb, "SecP256r1MLKEM768", true, true},
+    {0x11ec, "X25519MLKEM768", true, true},
+    {0x11ed, "SecP384r1MLKEM1024", true, true},
+    {0x6399, "X25519Kyber768Draft00", true, true},  // pre-standard hybrid, still seen on servers
+};
+
+const GroupInfo* find_group(uint32_t id) {
+    for (const GroupInfo& gi : kGroups)
+        if (gi.id == id)
+            return &gi;
+    return nullptr;
+}
+
+// Schannel's configuration names for the ML-KEM groups (the Enable-TlsEccCurve /
+// "ECC Curve Order" strings). Listing a name in the credential's disabled crypto
+// removes that group from the ClientHello even when the machine enables it; names
+// Schannel does not know are ignored. "X25519_MLKEM768" was verified on 26200.9974;
+// the match looked case-sensitive there, so the lowercase spellings from the Learn
+// group table are listed as well.
+constexpr const wchar_t* kPqGroupConfigNames[] = {
+    L"X25519_MLKEM768",  L"SecP256r1_MLKEM768", L"SecP384r1_MLKEM1024", L"MLKEM512", L"MLKEM768", L"MLKEM1024",
+    L"x25519_mlkem768",  L"secp256r1_mlkem768", L"secp384r1_mlkem1024", L"mlkem512", L"mlkem768", L"mlkem1024",
+};
+static_assert(std::size(kPqGroupConfigNames) <= SCH_CRED_MAX_SUPPORTED_CRYPTO_SETTINGS);
+
+// Bounds-checked big-endian reader over a TLS structure.
+struct Reader {
+    const unsigned char* p;
+    size_t n;
+
+    bool skip(size_t k) {
+        if (k > n)
+            return false;
+        p += k;
+        n -= k;
+        return true;
+    }
+    bool uint(size_t bytes, uint32_t& v) {
+        if (bytes > n)
+            return false;
+        v = 0;
+        for (size_t i = 0; i < bytes; ++i)
+            v = (v << 8) | p[i];
+        return skip(bytes);
+    }
+    // Splits off the next `len` bytes as their own reader.
+    bool sub(size_t len, Reader& out) {
+        if (len > n)
+            return false;
+        out = {p, len};
+        return skip(len);
+    }
+};
+
+// True if the supported_groups extension of a ClientHello (one handshake record, as
+// Schannel's first token is) lists a post-quantum group.
+bool client_hello_offers_pq(const unsigned char* data, size_t len) {
+    Reader r{data, len}, rec{}, hs{}, exts{};
+    uint32_t v = 0, l = 0;
+    if (!r.uint(1, v) || v != 22 || !r.skip(2) || !r.uint(2, l) || !r.sub(l, rec))
+        return false;
+    if (!rec.uint(1, v) || v != 1 || !rec.uint(3, l) || !rec.sub(l, hs))
+        return false;
+    // legacy_version, random, session_id, cipher_suites, compression_methods, extensions
+    if (!hs.skip(2 + 32) || !hs.uint(1, l) || !hs.skip(l) || !hs.uint(2, l) || !hs.skip(l) || !hs.uint(1, l) ||
+        !hs.skip(l) || !hs.uint(2, l) || !hs.sub(l, exts))
+        return false;
+    while (exts.n > 0) {
+        uint32_t type = 0;
+        Reader ext{}, list{};
+        if (!exts.uint(2, type) || !exts.uint(2, l) || !exts.sub(l, ext))
+            return false;
+        if (type != 10)  // supported_groups
+            continue;
+        if (!ext.uint(2, l) || !ext.sub(l, list))
+            return false;
+        while (list.uint(2, v)) {
+            const GroupInfo* gi = find_group(v);
+            if (gi != nullptr && gi->pq)
+                return true;
+        }
+        return false;
+    }
+    return false;
+}
+
+// Builds a ClientHello locally (nothing is sent) to see which groups this credential
+// really offers: the machine configuration plus our disabled list decide it, and
+// neither is queryable directly.
+bool credential_offers_pq() {
+    SecBuffer out_buf{0, SECBUFFER_TOKEN, nullptr};
+    SecBufferDesc out_desc{SECBUFFER_VERSION, 1, &out_buf};
+    CtxtHandle ctx{};
+    ULONG attrs = 0;
+    char target[] = "pq-probe.invalid";
+    const SECURITY_STATUS st = InitializeSecurityContextA(&g.cred, nullptr, target, kIscFlags, 0, 0, nullptr, 0, &ctx,
+                                                          &out_desc, &attrs, nullptr);
+    bool pq = false;
+    if (st == SEC_I_CONTINUE_NEEDED && out_buf.pvBuffer != nullptr)
+        pq = client_hello_offers_pq(static_cast<const unsigned char*>(out_buf.pvBuffer), out_buf.cbBuffer);
+    if (out_buf.pvBuffer != nullptr)
+        FreeContextBuffer(out_buf.pvBuffer);
+    if (st == SEC_I_CONTINUE_NEEDED || st == SEC_E_OK)
+        DeleteSecurityContext(&ctx);
+    return pq;
+}
+
+void init_globals(const StartupOptions& options) {
     // Only TLS 1.2/1.3 are enabled; Schannel picks the highest both sides support.
     TLS_PARAMETERS params{};
     params.grbitDisabledProtocols = ~static_cast<DWORD>(SP_PROT_TLS1_2_CLIENT | SP_PROT_TLS1_3_CLIENT);
+
+    CRYPTO_SETTINGS no_pq[std::size(kPqGroupConfigNames)]{};
+    if (!options.post_quantum) {
+        for (size_t i = 0; i < std::size(kPqGroupConfigNames); ++i) {
+            const wchar_t* name = kPqGroupConfigNames[i];
+            const auto bytes = static_cast<USHORT>(wcslen(name) * sizeof(wchar_t));
+            no_pq[i].eAlgorithmUsage = TlsParametersCngAlgUsageKeyExchange;
+            no_pq[i].strCngAlgId = {bytes, bytes, const_cast<PWSTR>(name)};
+        }
+        params.cDisabledCrypto = static_cast<DWORD>(std::size(no_pq));
+        params.pDisabledCrypto = no_pq;
+    }
 
     SCH_CREDENTIALS creds{};
     creds.dwVersion = SCH_CREDENTIALS_VERSION;
@@ -53,7 +202,8 @@ void init_globals() {
         FreeCredentialsHandle(&g.cred);
         return;
     }
-    g.ok = true;
+    g.pq_offered = credential_offers_pq();
+    g.ok.store(true, std::memory_order_release);
 }
 
 // Moves an SSPI-allocated output token into `out` and frees it.
@@ -84,9 +234,23 @@ struct ClientSession::Impl {
     bool close_sent = false;
 };
 
-bool startup() {
-    std::call_once(g_once, init_globals);
+bool startup(const StartupOptions& options) {
+    std::call_once(g_once, init_globals, options);
     return g.ok;
+}
+
+bool post_quantum_available() {
+    return g.ok.load(std::memory_order_acquire) && g.pq_offered;
+}
+
+const char* group_name(uint16_t group) {
+    const GroupInfo* gi = find_group(group);
+    return gi != nullptr ? gi->name : "";
+}
+
+bool is_pq_hybrid_group(uint16_t group) {
+    const GroupInfo* gi = find_group(group);
+    return gi != nullptr && gi->hybrid;
 }
 
 const char* protocol_name(uint32_t sp_prot) {
@@ -397,16 +561,29 @@ bool ClientSession::shutdown(std::vector<char>& wire_out) {
     return st == SEC_E_OK || st == SEC_I_CONTINUE_NEEDED;
 }
 
-std::string ClientSession::cipher_suite() const {
+ClientSession::Info ClientSession::info() const {
+    Info out;
     if (!impl_->has_ctx || protocol_ == 0)
-        return {};
-    SecPkgContext_CipherInfo info{};
-    info.dwVersion = SECPKGCONTEXT_CIPHERINFO_V1;
-    if (QueryContextAttributesA(&impl_->ctx, SECPKG_ATTR_CIPHER_INFO, &info) != SEC_E_OK)
-        return {};
-    std::string out;
-    for (const WCHAR* w = info.szCipherSuite; *w != 0; ++w)
-        out.push_back(static_cast<char>(*w));
+        return out;
+    out.protocol = protocol_;
+    SecPkgContext_CipherInfo ci{};
+    ci.dwVersion = SECPKGCONTEXT_CIPHERINFO_V1;
+    if (QueryContextAttributesA(&impl_->ctx, SECPKG_ATTR_CIPHER_INFO, &ci) == SEC_E_OK) {
+        for (const WCHAR* w = ci.szCipherSuite; *w != 0; ++w)
+            out.cipher.push_back(static_cast<char>(*w));
+        // Not documented beyond "the key type", but on 26200 dwKeyType is the negotiated
+        // supported-group code point for TLS 1.3 and TLS 1.2 ECDHE alike (29 = x25519,
+        // 4588 = X25519MLKEM768; checked against the ServerHello key_share and the TLS 1.2
+        // ServerKeyExchange on the wire) and 0 for RSA key transport. Neither
+        // CONNECTION_INFO(_EX) nor KEY_INFO names the group.
+        if (ci.dwKeyType <= 0xffff)
+            out.group = static_cast<uint16_t>(ci.dwKeyType);
+    }
+    out.key_exchange = group_name(out.group);
+    out.pq_hybrid = is_pq_hybrid_group(out.group);
+    SecPkgContext_SessionInfo session{};
+    if (QueryContextAttributesA(&impl_->ctx, SECPKG_ATTR_SESSION_INFO, &session) == SEC_E_OK)
+        out.resumed = (session.dwFlags & SSL_SESSION_RECONNECT) != 0;
     return out;
 }
 
