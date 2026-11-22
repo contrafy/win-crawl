@@ -27,20 +27,12 @@ if(WINCRAWL_BUILD_FUZZ)
   execute_process(COMMAND ${CMAKE_CXX_COMPILER} /clang:-print-resource-dir
     OUTPUT_VARIABLE WC_CLANG_RESOURCE_DIR OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
   file(TO_CMAKE_PATH "${WC_CLANG_RESOURCE_DIR}/lib/windows" WC_CLANG_RT_DIR)
-  if(NOT EXISTS "${WC_CLANG_RT_DIR}/clang_rt.fuzzer_no_main-x86_64.lib")
-    message(FATAL_ERROR "libFuzzer runtime not found in ${WC_CLANG_RT_DIR}")
-  endif()
-  if(EXISTS "${WC_CLANG_RT_DIR}/clang_rt.asan_static_runtime_thunk-x86_64.lib")
-    # LLVM >= 20: a single ASan DLL, reached through a thunk under /MT.
-    set(WC_ASAN_LIBS clang_rt.asan_dynamic-x86_64.lib clang_rt.asan_static_runtime_thunk-x86_64.lib)
-    set(WC_ASAN_DLL "${WC_CLANG_RT_DIR}/clang_rt.asan_dynamic-x86_64.dll")
-  elseif(EXISTS "${WC_CLANG_RT_DIR}/clang_rt.asan-x86_64.lib")
-    # Older LLVM: the static runtime, linked whole as the clang driver does.
-    set(WC_ASAN_LIBS -WHOLEARCHIVE:clang_rt.asan-x86_64.lib -WHOLEARCHIVE:clang_rt.asan_cxx-x86_64.lib)
-    set(WC_ASAN_DLL "")
-  else()
-    message(FATAL_ERROR "ASan runtime not found in ${WC_CLANG_RT_DIR}")
-  endif()
+  # LLVM >= 20 layout: one ASan DLL, reached through a thunk under /MT.
+  foreach(lib IN ITEMS fuzzer_no_main asan_dynamic asan_static_runtime_thunk)
+    if(NOT EXISTS "${WC_CLANG_RT_DIR}/clang_rt.${lib}-x86_64.lib")
+      message(FATAL_ERROR "clang_rt.${lib}-x86_64.lib not found in ${WC_CLANG_RT_DIR} (needs LLVM >= 20 with compiler-rt)")
+    endif()
+  endforeach()
 endif()
 
 # Shared compile settings; every wincrawl target links this. clang-cl accepts
@@ -60,7 +52,9 @@ if(WINCRAWL_BUILD_FUZZ)
   target_compile_options(wc_options INTERFACE -fsanitize=address -fsanitize=fuzzer-no-link)
   target_compile_definitions(wc_options INTERFACE _DISABLE_VECTOR_ANNOTATION _DISABLE_STRING_ANNOTATION)
   target_link_directories(wc_options INTERFACE ${WC_CLANG_RT_DIR})
-  target_link_libraries(wc_options INTERFACE ${WC_ASAN_LIBS} clang_rt.fuzzer_no_main-x86_64.lib)
+  target_link_libraries(wc_options INTERFACE
+    clang_rt.asan_dynamic-x86_64.lib clang_rt.asan_static_runtime_thunk-x86_64.lib
+    clang_rt.fuzzer_no_main-x86_64.lib)
 endif()
 
 if(WINCRAWL_BUILD_TESTS)
