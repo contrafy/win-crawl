@@ -10,6 +10,10 @@
 namespace wc::dns {
 namespace {
 
+// A reply up to the advertised size must fit one receive buffer, or the
+// socket would drop exactly the large answers EDNS asked for.
+static_assert(kEdnsUdpSize <= net::UdpSocket::kRecvBufferSize);
+
 constexpr uint32_t kMaxInflightCap = 32768;  // slot index + 1 must fit by_txid_'s uint16_t
 constexpr size_t kRecvDepth = 64;
 constexpr int kRecvBufferBytes = 4 << 20;
@@ -67,6 +71,12 @@ Resolver::Resolver(net::Loop& loop, ResolverConfig config)
     if (config_.servers.empty()) config_.servers = system_dns_servers();
     config_.attempts = std::max<uint32_t>(config_.attempts, 1);
     config_.max_inflight = std::clamp<uint32_t>(config_.max_inflight, 1, kMaxInflightCap);
+    // RFC 6891 treats sizes below 512 as 512; above the receive buffer, the
+    // socket would drop the very replies the size invites.
+    if (config_.edns_udp_size != 0) {
+        config_.edns_udp_size = std::clamp<uint16_t>(config_.edns_udp_size, 512,
+                                                     static_cast<uint16_t>(net::UdpSocket::kRecvBufferSize));
+    }
 
     slots_.resize(config_.max_inflight);
     free_slots_.reserve(config_.max_inflight);
@@ -79,48 +89,68 @@ Resolver::Resolver(net::Loop& loop, ResolverConfig config)
 
 Resolver::~Resolver() = default;
 
-void Resolver::post_result(Callback&& cb, Status status, uint32_t ipv4_be) {
+void Resolver::post_result(Callback&& cb, HttpsCallback&& https_cb, Status status, uint32_t ipv4_be) {
     // Captures only the callback so a queued result never touches the resolver.
-    loop_.post([cb = std::move(cb), status, ipv4_be] { cb(status, ipv4_be); });
+    if (cb) {
+        loop_.post([cb = std::move(cb), status, ipv4_be] { cb(status, ipv4_be); });
+    } else {
+        loop_.post([cb = std::move(https_cb), status] { cb(status, HttpsRecord{}); });
+    }
 }
 
 void Resolver::resolve(std::string_view host, Callback cb) {
-    if (shut_down_) {
-        ++counters_.cancelled;
-        post_result(std::move(cb), Status::Timeout, 0);
+    uint32_t literal = 0;
+    if (!shut_down_ && parse_ipv4_literal(host, literal)) {
+        ++counters_.literals;
+        post_result(std::move(cb), nullptr, Status::Ok, literal);
         return;
     }
+    submit(host, kTypeA, std::move(cb), nullptr);
+}
+
+void Resolver::resolve_https(std::string_view host, HttpsCallback cb) {
+    ++counters_.https_requests;
     uint32_t literal = 0;
-    if (parse_ipv4_literal(host, literal)) {
+    if (!shut_down_ && parse_ipv4_literal(host, literal)) {
         ++counters_.literals;
-        post_result(std::move(cb), Status::Ok, literal);
+        post_result(nullptr, std::move(cb), Status::NoAnswer, 0);
+        return;
+    }
+    submit(host, kTypeHttps, nullptr, std::move(cb));
+}
+
+void Resolver::submit(std::string_view host, uint16_t qtype, Callback&& cb, HttpsCallback&& https_cb) {
+    if (shut_down_) {
+        ++counters_.cancelled;
+        post_result(std::move(cb), std::move(https_cb), Status::Timeout, 0);
         return;
     }
     uint8_t probe[kMaxQuerySize];
-    if (build_query(0, host, kTypeA, probe, sizeof probe) == 0) {
+    if (build_query(0, host, qtype, probe, sizeof probe) == 0) {
         ++counters_.invalid;
-        post_result(std::move(cb), Status::Invalid, 0);
+        post_result(std::move(cb), std::move(https_cb), Status::Invalid, 0);
         return;
     }
     if (open_error_ != 0 || config_.servers.empty()) {
         ++counters_.servfail;
-        post_result(std::move(cb), Status::ServFail, 0);
+        post_result(std::move(cb), std::move(https_cb), Status::ServFail, 0);
         return;
     }
 
-    std::string name(host);
+    Pending request{std::string(host), qtype, std::move(cb), std::move(https_cb)};
+    std::string& name = request.host;
     if (name.back() == '.') name.pop_back();
     for (char& c : name) {
         if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + ('a' - 'A'));
     }
     if (free_slots_.empty() || !queue_.empty()) {
-        queue_.push_back({std::move(name), std::move(cb)});
+        queue_.push_back(std::move(request));
         return;
     }
-    start(std::move(name), std::move(cb));
+    start(std::move(request));
 }
 
-void Resolver::start(std::string&& host, Callback&& cb) {
+void Resolver::start(Pending&& request) {
     const uint32_t index = free_slots_.back();
     free_slots_.pop_back();
     Slot& slot = slots_[index];
@@ -131,10 +161,13 @@ void Resolver::start(std::string&& host, Callback&& cb) {
     } while (by_txid_[txid] != 0);
     by_txid_[txid] = static_cast<uint16_t>(index + 1);
 
-    slot.host = std::move(host);
-    slot.cb = std::move(cb);
+    slot.host = std::move(request.host);
+    slot.cb = std::move(request.cb);
+    slot.https_cb = std::move(request.https_cb);
+    slot.qtype = request.qtype;
     slot.txid = txid;
     slot.attempt = 0;
+    slot.edns = config_.edns_udp_size != 0;
     // Spread first attempts across servers; retries rotate from there.
     slot.server = next_server_;
     next_server_ = (next_server_ + 1) % static_cast<uint32_t>(config_.servers.size());
@@ -145,7 +178,8 @@ void Resolver::start(std::string&& host, Callback&& cb) {
 void Resolver::send_attempt(uint32_t index) {
     Slot& slot = slots_[index];
     uint8_t packet[kMaxQuerySize];
-    const size_t len = build_query(slot.txid, slot.host, kTypeA, packet, sizeof packet);
+    const size_t len =
+        build_query(slot.txid, slot.host, slot.qtype, packet, sizeof packet, slot.edns ? config_.edns_udp_size : 0);
     // A failed send is left to the attempt timer, which retries on the next server.
     if (socket_.send_to(config_.servers[slot.server], reinterpret_cast<const char*>(packet), len)) {
         ++counters_.queries_sent;
@@ -167,7 +201,7 @@ void Resolver::on_timeout(uint32_t index, uint16_t txid) {
 void Resolver::retry_or_fail(uint32_t index, Status final_status) {
     Slot& slot = slots_[index];
     if (slot.attempt + 1 >= config_.attempts) {
-        finish(index, final_status, 0);
+        finish(index, final_status, nullptr);
         return;
     }
     if (slot.timer != 0) {
@@ -180,7 +214,7 @@ void Resolver::retry_or_fail(uint32_t index, Status final_status) {
     send_attempt(index);
 }
 
-void Resolver::finish(uint32_t index, Status status, uint32_t ipv4_be) {
+void Resolver::finish(uint32_t index, Status status, const Response* reply) {
     Slot& slot = slots_[index];
     if (slot.timer != 0) {
         loop_.cancel_timer(slot.timer);
@@ -189,7 +223,9 @@ void Resolver::finish(uint32_t index, Status status, uint32_t ipv4_be) {
     by_txid_[slot.txid] = 0;
     slot.active = false;
     Callback cb = std::move(slot.cb);
+    HttpsCallback https_cb = std::move(slot.https_cb);
     slot.cb = nullptr;
+    slot.https_cb = nullptr;
     free_slots_.push_back(index);
 
     switch (status) {
@@ -201,14 +237,45 @@ void Resolver::finish(uint32_t index, Status status, uint32_t ipv4_be) {
     case Status::Invalid: ++counters_.invalid; break;
     }
 
+    uint32_t ipv4_be = 0;
+    HttpsRecord record;
+    if (cb) {
+        if (status == Status::Ok) ipv4_be = reply->addrs[0];
+    } else if (reply != nullptr) {
+        record.malformed = reply->https_malformed;
+        record.cname_hops = reply->cname_hops;
+        if (record.malformed) ++counters_.https_malformed;
+        if (status == Status::Ok) {
+            const HttpsRr& rr = reply->https;
+            ++counters_.https_present;
+            record.present = true;
+            record.alias_mode = rr.alias_mode();
+            record.priority = rr.priority;
+            record.target.assign(rr.target_name());
+            record.alpn_h3 = rr.alpn_h3;
+            record.alpn_h2 = rr.alpn_h2;
+            record.alpn_http11 = rr.alpn_http11;
+            record.ech = rr.ech;
+            record.port = rr.port;
+            record.no_default_alpn = rr.no_default_alpn;
+            record.ipv4hint = rr.ipv4hint;
+            record.ipv6hint = rr.ipv6hint;
+            record.rrset_size = reply->https_count;
+        }
+    }
+
     // Refill before the callback so a re-entrant resolve() queues behind
     // older requests instead of jumping the FIFO.
     if (!queue_.empty()) {
         Pending next = std::move(queue_.front());
         queue_.pop_front();
-        start(std::move(next.host), std::move(next.cb));
+        start(std::move(next));
     }
-    cb(status, ipv4_be);
+    if (cb) {
+        cb(status, ipv4_be);
+    } else {
+        https_cb(status, record);
+    }
 }
 
 void Resolver::on_datagram(net::UdpSocket&, const char* data, size_t len, const sockaddr_in& from) {
@@ -225,7 +292,7 @@ void Resolver::on_datagram(net::UdpSocket&, const char* data, size_t len, const 
         return;
     }
     const uint16_t slot_ref = by_txid_[r.id];
-    if (!r.qr || r.qtype != kTypeA || r.qclass != kClassIn) {
+    if (!r.qr || (r.qtype != kTypeA && r.qtype != kTypeHttps) || r.qclass != kClassIn) {
         ++counters_.mismatched;
         return;
     }
@@ -234,7 +301,8 @@ void Resolver::on_datagram(net::UdpSocket&, const char* data, size_t len, const 
         return;
     }
     const uint32_t index = slot_ref - 1u;
-    if (!name_equal(r.question(), slots_[index].host)) {
+    Slot& slot = slots_[index];
+    if (r.qtype != slot.qtype || !name_equal(r.question(), slot.host)) {
         ++counters_.mismatched;
         return;
     }
@@ -243,17 +311,25 @@ void Resolver::on_datagram(net::UdpSocket&, const char* data, size_t len, const 
     case kNoError:
         if (r.tc) {
             ++counters_.truncated;
-            finish(index, Status::NoAnswer, 0);
-        } else if (r.addr_count != 0) {
-            finish(index, Status::Ok, r.addrs[0]);
+            finish(index, Status::NoAnswer, nullptr);
+        } else if (slot.qtype == kTypeA) {
+            finish(index, r.addr_count != 0 ? Status::Ok : Status::NoAnswer, &r);
         } else {
-            finish(index, Status::NoAnswer, 0);
+            finish(index, r.https_count != 0 && !r.https_malformed ? Status::Ok : Status::NoAnswer, &r);
         }
         break;
     case kNxDomain:
-        finish(index, Status::NxDomain, 0);
+        finish(index, Status::NxDomain, nullptr);
         break;
-    default:  // SERVFAIL, REFUSED, FORMERR, NOTIMP...: another server may do better
+    case kFormErr:
+        // Possibly a server that rejects EDNS; later attempts go without it.
+        if (slot.edns) {
+            slot.edns = false;
+            ++counters_.edns_fallbacks;
+        }
+        retry_or_fail(index, Status::ServFail);
+        break;
+    default:  // SERVFAIL, REFUSED, NOTIMP...: another server may do better
         retry_or_fail(index, Status::ServFail);
         break;
     }
@@ -264,26 +340,39 @@ void Resolver::shutdown() {
     shut_down_ = true;
 
     std::vector<Callback> failed;
-    failed.reserve(inflight() + queue_.size());
+    std::vector<HttpsCallback> failed_https;
     for (Slot& slot : slots_) {
         if (!slot.active) continue;
         if (slot.timer != 0) loop_.cancel_timer(slot.timer);
         slot.timer = 0;
         by_txid_[slot.txid] = 0;
         slot.active = false;
-        failed.push_back(std::move(slot.cb));
+        if (slot.cb) {
+            failed.push_back(std::move(slot.cb));
+        } else {
+            failed_https.push_back(std::move(slot.https_cb));
+        }
         slot.cb = nullptr;
+        slot.https_cb = nullptr;
     }
     free_slots_.clear();
     for (uint32_t i = static_cast<uint32_t>(slots_.size()); i-- > 0;) free_slots_.push_back(i);
-    for (Pending& p : queue_) failed.push_back(std::move(p.cb));
+    for (Pending& p : queue_) {
+        if (p.cb) {
+            failed.push_back(std::move(p.cb));
+        } else {
+            failed_https.push_back(std::move(p.https_cb));
+        }
+    }
     queue_.clear();
-    counters_.cancelled += failed.size();
+    counters_.cancelled += failed.size() + failed_https.size();
 
     socket_.close();
-    if (!failed.empty()) {
-        loop_.post([failed = std::move(failed)] {
+    if (!failed.empty() || !failed_https.empty()) {
+        loop_.post([failed = std::move(failed), failed_https = std::move(failed_https)] {
             for (const Callback& cb : failed) cb(Status::Timeout, 0);
+            const HttpsRecord none;
+            for (const HttpsCallback& cb : failed_https) cb(Status::Timeout, none);
         });
     }
 }
