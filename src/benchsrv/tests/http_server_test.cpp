@@ -32,6 +32,18 @@ std::pair<uint64_t, PagePlan> find_page(const Behavior& b, Pred pred) {
     }
 }
 
+// The server counts a response when its send completes, which can be after the
+// client has already read it; poll briefly instead of reading once.
+HttpCounters counters_when(const HttpServer& server, uint64_t requests) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    HttpCounters c = server.counters();
+    while (c.requests < requests && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        c = server.counters();
+    }
+    return c;
+}
+
 struct Fixture {
     Fixture(HttpServerConfig config = {}) : server(behavior, config) {
         wc::net::startup();
@@ -82,7 +94,7 @@ TEST_CASE("keep-alive serves several requests on one connection") {
     CHECK(b.status == robots.status);
     CHECK(reader.buffered() == 0);
 
-    const HttpCounters c = f.server.counters();
+    const HttpCounters c = counters_when(f.server, 4);
     CHECK(c.requests == 4);
     CHECK(c.accepted == 1);
     CHECK(c.robots == 2);
