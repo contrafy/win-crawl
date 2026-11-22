@@ -42,6 +42,9 @@ struct Config {
 
     unsigned stats_interval_ms = 2000;
     std::string json_path;
+    std::string record_path;  // --record: one JSON line per unique host (record.h)
+    bool https_rr = false;    // --https-rr: also query each resolved host's HTTPS RR (needs --record)
+    bool post_quantum = true; // real only: offer the hybrid post-quantum TLS group (--no-pq disables)
     bool quiet = false;
 };
 

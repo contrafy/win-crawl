@@ -109,6 +109,10 @@ std::string format_summary(const Snapshot& s, const RunInfo& info) {
     appendf(out, "Other fetch failures (reset, bad reply, too large) %llu, port exhaustion retries %llu\n",
             u(s[Counter::OtherFail]), u(s[Counter::PortExhaustion]));
     appendf(out, "Peak in-flight %llu\n", u(info.peak_inflight));
+    if (info.pq_requested) {
+        appendf(out, "Post-quantum key exchange: %s, %s\n", *info.pq_requested ? "requested" : "disabled (--no-pq)",
+                info.pq_offered.value_or(false) ? "offered in the ClientHello" : "not offered in the ClientHello");
+    }
     return out;
 }
 
@@ -123,7 +127,9 @@ std::string format_json(const Snapshot& s, const RunInfo& info) {
         }
         appendf(out, ",\"%s\":%llu", kCounterNames[i], static_cast<unsigned long long>(s.values[i]));
     }
-    appendf(out, ",\"peak_inflight\":%llu}\n", static_cast<unsigned long long>(info.peak_inflight));
+    appendf(out, ",\"peak_inflight\":%llu", static_cast<unsigned long long>(info.peak_inflight));
+    const auto opt = [](const std::optional<bool>& v) { return !v ? "null" : *v ? "true" : "false"; };
+    appendf(out, ",\"pq_requested\":%s,\"pq_offered\":%s}\n", opt(info.pq_requested), opt(info.pq_offered));
     return out;
 }
 

@@ -64,6 +64,10 @@ struct FetchResult {
     const parse::ResponseParser* reply = nullptr;
     std::string_view body;
     bool reused = false;  // request went out on a kept-alive connection
+    // The TLS session of the connection this fetch used (https only; null for
+    // plain http or when TCP connect failed), failed handshakes included.
+    // Valid only for the duration of the callback.
+    const tls::ClientSession* tls = nullptr;
 };
 
 class Connection;

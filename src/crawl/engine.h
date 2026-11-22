@@ -10,6 +10,7 @@
 #include "crawl/config.h"
 #include "crawl/dedupe.h"
 #include "crawl/input.h"
+#include "crawl/record.h"
 #include "crawl/stats.h"
 
 #include <atomic>
@@ -44,6 +45,9 @@ public:
     void request_stop();
     bool stop_requested() const { return stop_.load(std::memory_order_acquire); }
 
+    // --record: lines written (valid after run()).
+    uint64_t records_written() const { return records_written_.load(std::memory_order_relaxed); }
+
 private:
     friend class Worker;
 
@@ -55,6 +59,8 @@ private:
     Stats& stats_;
     HostSet hosts_;
     IpSet ips_;
+    RecordWriter records_;
+    std::atomic<uint64_t> records_written_{0};
     std::atomic<bool> stop_{false};
     std::mutex mutex_;  // guards workers_ against request_stop() racing loop exit
     std::vector<Worker*> workers_;

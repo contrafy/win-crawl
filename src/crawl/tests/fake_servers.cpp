@@ -104,6 +104,10 @@ void FakeDns::add(const std::string& host, uint32_t ipv4_be) {
     records_[lower(host)] = ipv4_be;
 }
 
+void FakeDns::add_https(const std::string& host, std::string rdata) {
+    https_[lower(host)] = std::move(rdata);
+}
+
 uint16_t FakeDns::start() {
     uint16_t port = 0;
     thread_.call([&] {
@@ -143,19 +147,29 @@ void FakeDns::on_datagram(net::UdpSocket& socket, const char* data, size_t len, 
     ++queries_;
 
     std::string out(data, pos);  // header + question
-    const auto it = records_.find(lower(name));
-    const bool answer = it != records_.end() && qtype == 1;
+    const std::string key = lower(name);
+    const auto it = records_.find(key);
+    const auto https = https_.find(key);
+    const bool a_answer = it != records_.end() && qtype == 1;
+    const bool https_answer = it != records_.end() && qtype == 65 && https != https_.end();
     out[2] = static_cast<char>(0x80 | (p[2] & 0x78) | 0x04 | (p[2] & 0x01));  // QR, opcode, AA, RD
     out[3] = static_cast<char>(0x80 | (it == records_.end() ? 3 : 0));       // RA, NXDOMAIN/NOERROR
     out[4] = 0;
     out[5] = 1;
     out[6] = 0;
-    out[7] = answer ? 1 : 0;
+    out[7] = a_answer || https_answer ? 1 : 0;
     out[8] = out[9] = out[10] = out[11] = 0;
-    if (answer) {
+    if (a_answer) {
         const char rr[] = {'\xc0', '\x0c', 0, 1, 0, 1, 0, 0, 0, 60, 0, 4};
         out.append(rr, sizeof(rr));
         out.append(reinterpret_cast<const char*>(&it->second), 4);
+    } else if (https_answer) {
+        const std::string& rdata = https->second;
+        const char rr[] = {'\xc0', '\x0c', 0, 65, 0, 1, 0, 0, 0, 60};
+        out.append(rr, sizeof(rr));
+        out.push_back(static_cast<char>(rdata.size() >> 8));
+        out.push_back(static_cast<char>(rdata.size() & 0xff));
+        out.append(rdata);
     }
     socket.send_to(from, out.data(), out.size());
 }

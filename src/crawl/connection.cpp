@@ -424,6 +424,7 @@ void Connection::deliver() {
     FetchResult result;
     result.error = error_;
     result.reused = reused_;
+    result.tls = is_tls_ && tls_ ? &*tls_ : nullptr;
     if (error_ == FetchError::None) {
         result.status = parser_.status();
         result.reply = &parser_;

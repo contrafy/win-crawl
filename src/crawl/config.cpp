@@ -26,9 +26,12 @@ enum class Opt {
     PageLimit,
     NoKeepalive,
     Insecure,
+    NoPq,
     MaxRedirects,
     StatsInterval,
     Json,
+    Record,
+    HttpsRr,
     Quiet,
     Help,
 };
@@ -54,9 +57,12 @@ constexpr OptSpec kOptions[] = {
     {Opt::PageLimit, "page-limit", 0, true},
     {Opt::NoKeepalive, "no-keepalive", 0, false},
     {Opt::Insecure, "insecure", 0, false},
+    {Opt::NoPq, "no-pq", 0, false},
     {Opt::MaxRedirects, "max-redirects", 0, true},
     {Opt::StatsInterval, "stats-interval", 0, true},
     {Opt::Json, "json", 0, true},
+    {Opt::Record, "record", 0, true},
+    {Opt::HttpsRr, "https-rr", 0, false},
     {Opt::Quiet, "quiet", 'q', false},
     {Opt::Help, "help", 'h', false},
 };
@@ -246,6 +252,9 @@ ParseResult apply(const OptSpec& spec, std::string_view value, Config& cfg, Give
     case Opt::Insecure:
         cfg.insecure = true;
         break;
+    case Opt::NoPq:
+        cfg.post_quantum = false;
+        break;
     case Opt::MaxRedirects:
         if (!parse_range(value, 0, 20, v)) return bad("an integer in 0..20");
         cfg.max_redirects = static_cast<unsigned>(v);
@@ -258,11 +267,18 @@ ParseResult apply(const OptSpec& spec, std::string_view value, Config& cfg, Give
         if (value.empty()) return bad("a file path");
         cfg.json_path = std::string(value);
         break;
+    case Opt::Record:
+        if (value.empty()) return bad("a file path");
+        cfg.record_path = std::string(value);
+        break;
+    case Opt::HttpsRr:
+        cfg.https_rr = true;
+        break;
     case Opt::Quiet:
         cfg.quiet = true;
         break;
     case Opt::Help:
-        return ParseResult{ParseStatus::Help, {}};
+        return ParseResult{ParseStatus::Help, {}, {}};
     }
     return {};
 }
@@ -346,6 +362,9 @@ ParseResult parse_args(int argc, const char* const* argv, Config& out) {
         return error("unexpected argument '" + std::string(positional[1]) + "' (only one <url-file> is accepted)");
     }
     cfg.input_path = std::string(positional[0]);
+    if (cfg.https_rr && cfg.record_path.empty()) {
+        return error("--https-rr needs --record FILE (the answers are only recorded there)");
+    }
 
     if (cfg.threads == 0) {
         cfg.threads = logical_cpu_count();
@@ -401,11 +420,18 @@ HTTP:
   --no-keepalive          fresh connection per request; in classic mode also
                           HTTP/1.0 requests like the original crawler
   --insecure              real mode: skip TLS certificate verification
+  --no-pq                 real mode: do not offer the hybrid post-quantum key
+                          exchange (X25519MLKEM768); it is offered by default
   --max-redirects N       real mode: redirects followed per page (default 5)
 
 Output:
   --stats-interval MS     periodic status interval (default 2000)
   --json FILE             write the final statistics as JSON to FILE
+  --record FILE           write one JSON line per unique host attempted (DNS,
+                          robots, status, redirects, TLS, Alt-Svc, HSTS, ...;
+                          see docs/study-method.md)
+  --https-rr              also query each resolved host's HTTPS DNS record and
+                          record it (needs --record)
   -q, --quiet             no periodic status lines
   -h, --help              this text
 
