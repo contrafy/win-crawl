@@ -109,6 +109,13 @@ at thousands of lookups per second, so they are the default
 (`--dns 1.1.1.1,1.0.0.1`, 2048 in flight). `--dns system` uses the OS servers
 and caps itself at 64 in flight.
 
+Queries carry an EDNS0 OPT record (1232-byte UDP size, per DNS Flag Day 2020),
+with a plain-query fallback after FORMERR. The resolver also looks up HTTPS
+resource records (RFC 9460, type 65) through the same in-flight, retry and
+validation machinery. Those records are how sites advertise HTTP/3 and
+Encrypted ClientHello in DNS. Details and measurements:
+[`dns-notes.md`](dns-notes.md).
+
 ## HTTP, links and robots
 
 - **Response parser** (`src/parse/http.h`). Incremental over a caller-owned
@@ -127,8 +134,11 @@ and caps itself at 64 in flight.
   parser drops https links, ignores `<base>`, and counts empty hrefs, frames
   and meta refreshes.
 - **robots.txt** (`src/parse/robots.h`). RFC 9309 group selection, `*` and `$`
-  wildcards, longest match wins, Allow wins ties. Used only by real mode;
-  classic mode keeps the assignment's "4xx means no robots file" rule.
+  wildcards, longest match wins, Allow wins ties. Matching is linear in
+  pattern + path length. The first version was quadratic, and fuzzing showed a
+  hostile 512 KiB robots.txt could stall a loop for 300 ms per check. Used
+  only by real mode; classic mode keeps the assignment's "4xx means no robots
+  file" rule.
 
 ## TLS (real mode)
 
@@ -146,6 +156,68 @@ as `SEC_I_RENEGOTIATE` after the handshake; close_notify arrives as
 `SEC_I_CONTEXT_EXPIRED`; and some servers (google.com) send a TCP FIN with no
 close_notify at all, so HTTP framing, not TLS, decides whether a reply was
 complete.
+
+**Post-quantum key exchange.** Real mode offers the hybrid X25519MLKEM768
+group when the machine allows it. On Windows that is a machine-wide setting
+(`Enable-TlsEccCurve -Name X25519_MLKEM768 -Position 0`, admin); there is no
+per-process way to add a group. `--no-pq` removes the ML-KEM groups for one
+process through the credential's deny list. The negotiated group is read from
+`SecPkgContext_CipherInfo.dwKeyType`, which is undocumented but matched the
+IANA code point on the wire in every check. Against 48 live hosts the hybrid
+group cost +0.9 ms (+3%) median per handshake, and no host failed. See
+[`tls-notes.md`](tls-notes.md).
+
+## Measurement mode
+
+`--record FILE` makes real mode a measurement instrument. It writes one JSON
+line per unique host with its DNS outcome, robots outcome, final status and
+redirects, the TLS version, cipher and group of the site's first handshake,
+Alt-Svc h3, HSTS, Server header, and whether the site is behind Cloudflare
+(`CF-RAY` header and published IP ranges). `--https-rr` adds the host's HTTPS
+DNS record. Records go to per-loop buffers that a single writer thread
+drains, so the overhead is below run-to-run noise at ~8.5K records/s.
+`tools/study/analyze.py` turns a record file into a report with Wilson 95%
+intervals. Method: [`study-method.md`](study-method.md); results:
+[`study-2026.md`](study-2026.md).
+
+## Where the CPU goes
+
+ETW CPU sampling (xperf kernel session, stacks folded and rendered with
+`tools/profile/`) gives two different pictures. Full write-up:
+[`profiling.md`](profiling.md).
+
+- **Loopback rig, classic mode: 97% kernel.** Connection setup (`ConnectEx`,
+  the tcpip path cache, kernel lock spinning) and DNS `sendto` dominate.
+  wincrawl's own code is about 3% of samples, and the link extractor alone is
+  0.5%. More loops stop helping past ~8: the kernel locks set the ceiling.
+
+  ![Flame graph: loopback rig, classic mode](img/flame-rig-classic.svg)
+
+- **Real mode: TLS, half of it in another process.** Schannel runs the
+  handshake in `lsass.exe`, which burned as much CPU as the crawler itself.
+  Inside wincrawl, certificate chain verification is the top item (33%). Two
+  measured, not-yet-applied wins:
+  - connected UDP sockets for DNS (~15% of rig CPU);
+  - letting Schannel's own chain build stand in for the second one (up to
+    ~17% of real-mode CPU).
+
+  ![Flame graph: real mode with TLS](img/flame-real-tls.svg)
+
+## Testing and fuzzing
+
+- **Unit and end-to-end tests:** doctest suites per module, plus end-to-end
+  crawls over loopback against in-process fake DNS and HTTP servers. CI runs
+  them in Debug and Release on every push.
+- **Fuzzing:** a `fuzz` preset (clang-cl, ASan, libFuzzer) builds eight
+  targets: DNS responses, HTTPS RRs, HTTP responses, URLs, robots.txt, link
+  extraction, the bench server's DNS codec, and record serialization.
+  - **Checks beyond crashes:** whole vs split-buffer HTTP parsing, URL round
+    trips, robots matching against a reference matcher, count-only vs
+    collecting link extraction, and the crawler's DNS codec against the rig's
+    independent one.
+  - **CI:** fuzzes each target for 60 s and runs the unit tests under ASan.
+  - **Local campaign:** ~335M executions found one bug, the quadratic robots
+    matcher above. See [`fuzzing.md`](fuzzing.md).
 
 ## Windows limits worth knowing
 
