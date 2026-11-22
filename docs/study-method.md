@@ -17,10 +17,10 @@ as the web answers in 2026.
 cmake --preset release; cmake --build --preset release
 
 # The study run (real mode, post-quantum offered, HTTPS RRs queried)
-build\release\wincrawl.exe --mode real -c 8000 --record study.jsonl --https-rr --json study.json sample_urls\URL-input-1M.txt
+build\release\wincrawl.exe --mode real --record study.jsonl --https-rr --json study.json sample_urls\URL-input-1M.txt
 
 # Control run without post-quantum groups in the ClientHello
-build\release\wincrawl.exe --mode real -c 8000 --record study-nopq.jsonl --no-pq sample_urls\URL-input-1M.txt
+build\release\wincrawl.exe --mode real --record study-nopq.jsonl --no-pq sample_urls\URL-input-1M.txt
 
 # Report
 python tools\study\analyze.py study.jsonl --seeds 1000000 --title "1M seeds, 2026" > study.md
