@@ -43,6 +43,7 @@ enum class Opt {
     MaxCrawlDelay,
     MaxRetryAfter,
     IpFailLimit,
+    MaxIpPenalty,
     NoCdnPolicy,
     CdnHostsPerIp,
     CdnIpConcurrency,
@@ -87,6 +88,7 @@ constexpr OptSpec kOptions[] = {
     {Opt::MaxCrawlDelay, "max-crawl-delay", 0, true},
     {Opt::MaxRetryAfter, "max-retry-after", 0, true},
     {Opt::IpFailLimit, "ip-fail-limit", 0, true},
+    {Opt::MaxIpPenalty, "max-ip-penalty", 0, true},
     {Opt::NoCdnPolicy, "no-cdn-policy", 0, false},
     {Opt::CdnHostsPerIp, "cdn-hosts-per-ip", 0, true},
     {Opt::CdnIpConcurrency, "cdn-ip-concurrency", 0, true},
@@ -333,6 +335,10 @@ ParseResult apply(const OptSpec& spec, std::string_view value, Config& cfg, Give
         if (!parse_range(value, 0, 1000, v)) return bad("an integer in 0..1000 (0 = never)");
         cfg.ip_fail_limit = static_cast<unsigned>(v);
         break;
+    case Opt::MaxIpPenalty:
+        if (!parse_range(value, 0, 600000, v)) return bad("milliseconds in 0..600000");
+        cfg.max_ip_penalty_ms = static_cast<unsigned>(v);
+        break;
     case Opt::NoCdnPolicy:
         cfg.cdn_policy = false;
         break;
@@ -384,6 +390,7 @@ GatePolicy gate_policy(const Config& cfg) {
         p.cdn_ranges = cfg.cdn_ranges != nullptr ? cfg.cdn_ranges : &cloudflare_ipv4();
     }
     p.fail_limit = cfg.ip_fail_limit;
+    p.max_penalty_ms = cfg.max_ip_penalty_ms;
     return p;
 }
 
@@ -539,9 +546,12 @@ Politeness (per target; see docs/politeness.md):
                           skips the page (default 30)
   --max-retry-after S     real mode: wait out a 429/503 Retry-After of up to S
                           seconds and retry once (default 30)
-  --ip-fail-limit N       after N failed connections in a row (refused,
-                          unreachable, timed out) skip the IP's other hosts
-                          (default 5; 0 = never)
+  --ip-fail-limit N       skip an IP's other hosts after N failed connections in
+                          a row on an IP that never answered (refused,
+                          unreachable, timed out), or after N 429/503 replies
+                          in a row (default 5; 0 = never; not for Cloudflare IPs)
+  --max-ip-penalty MS     cap on the extra spacing 429/503 replies add to an
+                          IP (default 10000)
   --cdn-hosts-per-ip N    hosts per IP inside Cloudflare's ranges (default:
                           1 with --hosts-per-ip 1, else unlimited)
   --cdn-ip-concurrency N  connections per Cloudflare IP (default 16)

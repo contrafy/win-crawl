@@ -28,18 +28,24 @@ connections.
 | hosts fetched per IP | 1 (the assignment's IP dedupe), both modes | `--hosts-per-ip N`, `0` or `--no-ip-dedupe` = unlimited |
 | connections open at once per IP | 2 | `--ip-concurrency N` (0 = no cap) |
 | time between connection starts to one IP | 250 ms | `--ip-interval MS` |
-| 429/503 back-off | the IP's spacing gains a penalty: max(interval, 1 s), doubling per throttle up to 60 s, halved by every normal reply; the next start waits it out | always on (off for CDN IPs) |
+| 429/503 back-off | the IP's spacing gains a penalty: max(interval, 1 s), doubling per throttle up to 10 s, halved by every normal reply; the next start waits it out | `--max-ip-penalty MS` (default 10000; off for CDN IPs) |
 | `Retry-After` on 429/503 | real mode: waited out (no socket held) and the request repeated once, if ≤ 30 s | `--max-retry-after S` |
 | robots.txt `Crawl-delay` | real mode: honoured between requests to that host, up to 30 s; above it the page is skipped (`skip: "crawl_delay"`) | `--max-crawl-delay S` |
-| unreachable IPs | after 5 failed connections in a row (refused, unreachable, timed out, no reply) the IP's remaining hosts are skipped (`skip: "ip_unreachable"`) | `--ip-fail-limit N` (0 = never) |
-| CDN IPs (Cloudflare ranges, `data/cloudflare-ips-v4.txt`) | 16 connections, no spacing, no back-off; host budget unlimited unless `--hosts-per-ip` is 1 | `--cdn-ip-concurrency`, `--cdn-ip-interval`, `--cdn-hosts-per-ip`, `--no-cdn-policy` |
-| redirects to a busy IP | wait ahead of new sites; at most 64 may wait per IP, past that the hop is given up (`fetch: "ip_busy"`) | fixed |
+| unreachable IPs | after 5 failed connections in a row (refused, unreachable, timed out, no reply) on an IP that has never answered HTTP, its remaining hosts are skipped (`skip: "ip_unreachable"`); an IP that answered once is never closed for failures | `--ip-fail-limit N` (0 = never; also sets the throttle breaker) |
+| throttling IPs | after 5 429/503 replies in a row (any normal reply resets the count) the IP's remaining hosts are skipped (`skip: "ip_throttled"`) | `--ip-fail-limit N` |
+| CDN IPs (Cloudflare ranges, `data/cloudflare-ips-v4.txt`) | 16 connections, no spacing, no back-off, no breakers; host budget unlimited unless `--hosts-per-ip` is 1 | `--cdn-ip-concurrency`, `--cdn-ip-interval`, `--cdn-hosts-per-ip`, `--no-cdn-policy` |
+| redirects to a busy IP | wait ahead of new sites; at most 64 may wait per IP, past that the hop is given up (`fetch: "ip_busy"`). Reconnects after a Crawl-delay or Retry-After are not capped | fixed |
 
 Why these choices:
 
 - **Real mode keeps a budget of 1 by default.** The published study, the
-  README numbers and every existing run stay reproducible with the same
-  command. Measurement runs opt in explicitly (recommended settings below).
+  README numbers and existing runs keep the same command and the same host
+  sample (the first host of each IP). The numbers are close, not identical:
+  redirect hops now pass their IP's gate (`ip_busy` / `ip_unreachable` hops
+  are possible), a robots.txt 429 in real mode means disallow, and a seed can
+  be skipped as `ip_unreachable` / `ip_throttled` when another host's
+  redirect already exhausted its IP. Measurement runs opt in explicitly
+  (recommended settings below).
 - **2 connections, 250 ms apart** is about 4 connection starts per second at
   most per IP: little load for a server that hosts thousands of sites, and
   still enough that a shared host with 2,000 sites finishes in ~30 minutes.
@@ -63,7 +69,15 @@ Why these choices:
 - **Unreachable IPs are cut short.** In the 1M study 23,818 IPs carrying
   78,557 hosts refused the first connection and 6,049 IPs (16,265 hosts) timed
   out. At 2 connections per IP, 4,899 refused hosts on one IP would take over
-  an hour of 2–5 s connect failures; the breaker stops after 5.
+  an hour of 2–5 s connect failures; the breaker stops after 5. It only
+  closes IPs that never answered: a big shared host that times out now and
+  then under load keeps being crawled.
+- **Throttling IPs are cut short too, and the penalty is capped at 10 s.** In
+  the 1M study the sampled host of 766 IPs answered only 429/503. Without a
+  breaker such an IP drains at one host per penalty period: at 60 s that is
+  17 hours for 1,000 hosts. After 5 throttles in a row the IP is given up
+  (`ip_throttled`), and a 10 s cap keeps an IP that throttles intermittently
+  moving at about one start per 10 s.
 
 ### Crawl-delay and RFC 9309
 
@@ -100,7 +114,14 @@ release / spacing timer (any loop) ─► pop waiter ─► post to its loop ─
   no socket, and up to `-c / threads` parked tasks per loop do not count
   against `-c`. The task pool grows to twice the slots for that.
 - **FIFO with priority.** Sites under way queue ahead of new sites, so a site
-  that started finishes first. At most 64 may wait per IP for a redirect hop.
+  that started finishes first. At most 64 may wait per IP for a redirect hop;
+  reconnects after a Crawl-delay or Retry-After are not capped (refusing them
+  would drop a page the site already agreed to serve).
+- **Reconnects keep their slot.** A site reconnecting to the same IP (after a
+  close, Crawl-delay or Retry-After) keeps its connection slot. If the IP's
+  previous start has not connected yet, it queues as a priority "holder"
+  waiter that is admitted without taking a second slot, so spacing still
+  counts from real connects.
 - **Who wakes waiters.** A release on any loop pops what the gate can admit
   and posts it to the waiter's loop. When the gate has room but its spacing has
   not elapsed, the loop that noticed arms a timer and stays alive until it
@@ -117,9 +138,10 @@ release / spacing timer (any loop) ─► pop waiter ─► post to its loop ─
   it acquires elsewhere), and a woken site always gets a task.
 - **Termination and Ctrl+C.** A loop's live count includes parked tasks and
   queued sites; it exits only when both are zero and its spacing timers have
-  fired. Ctrl+C cancels queued sites (they are still recorded, with
-  `robots_error: "aborted"`) and parked tasks; the e2e test stops a run with
-  ~290 hosts queued on one IP and it ends in under a second.
+  fired. Ctrl+C cancels queued sites and parked tasks; a site never attempted
+  is recorded with `skip: "stopped"` (counted as `stopped_hosts`, left out of
+  the fetched sample by the analyzer). The e2e test stops a run with ~290
+  hosts queued on one IP and it ends in under a second.
 
 ## Records and counters
 
@@ -127,32 +149,46 @@ New record keys, appended after `ms` (`docs/study-method.md` has the rest):
 
 | key | meaning |
 |---|---|
-| `skip` | why politeness skipped the host or its page: `ip_budget` (over the IP's host budget; `ip_dup` true), `ip_unreachable` (its IP failed `--ip-fail-limit` times in a row), `crawl_delay` (Crawl-delay above `--max-crawl-delay`); null otherwise |
+| `skip` | why the host or its page was not fetched: `ip_budget` (over the IP's host budget; `ip_dup` true), `ip_unreachable` (its IP never answered and failed `--ip-fail-limit` times in a row), `ip_throttled` (its IP answered 429/503 `--ip-fail-limit` times in a row), `stopped` (resolved but never attempted: the run was stopped), `crawl_delay` (Crawl-delay above `--max-crawl-delay`); null otherwise |
 | `wait_ms` | time the site waited on politeness: IP queue and spacing, Crawl-delay, Retry-After |
 | `crawl_delay` | Crawl-delay (seconds) in the seed origin's robots.txt, null if none |
 | `crawl_delay_ms` | the part of `wait_ms` spent waiting for a Crawl-delay |
 | `retry_after` | Retry-After (seconds) of the first 429/503 that carried one |
 | `retried` | that Retry-After was waited out and the request repeated |
 
-Redirect hops can also end with `fetch: "ip_busy"` or `"ip_unreachable"`.
+Redirect hops can also end with `fetch: "ip_busy"`, `"ip_unreachable"` or `"ip_throttled"`.
 
 `--json` keeps every existing key and appends, before `peak_inflight`:
 `ip_extra_hosts`, `ip_budget_skips`, `ip_unreachable`, `ip_busy`,
 `cdn_hosts`, `polite_waits`, `polite_wait_ms`, `crawl_delay_waits`,
-`crawl_delay_ms`, `crawl_delay_skips`, `throttled`, `retry_after_retries`.
-The `I` column still counts unique IPs (the first host of each); hosts
-fetched beyond the first per IP are `ip_extra_hosts`. The summary gains two
-lines, and the periodic rate line shows how many sites wait on politeness.
-`peak_inflight` now includes waiting sites, which hold no socket.
+`crawl_delay_ms`, `crawl_delay_skips`, `throttled`, `retry_after_retries`,
+`ip_throttled`, `stopped_hosts`. The `I` column still counts unique IPs (the
+first host of each actually fetched); hosts fetched beyond the first per IP
+are `ip_extra_hosts`. Both, like `cdn_hosts`, count a host only once it is
+fetched, not when it is admitted to a queue. The summary gains two lines (a
+third when the run was stopped), and the periodic rate line shows how many
+sites wait on politeness. `peak_inflight` now includes waiting sites, which
+hold no socket.
 
 ## Analysis: IP weighting
 
 With a host budget, hosts on big IPs are a sample. `tools/study/analyze.py`
 weights each fetched host by its IP's resolving hosts / fetched hosts
 (inverse-probability weighting, computed from the records themselves) and
-reports every HTTP/TLS fact unweighted and weighted, with a Wilson interval on
-the Kish effective sample size. It also reports coverage (fetched / resolving
-hosts) overall, on Cloudflare IPs and elsewhere, and a politeness summary.
+reports every HTTP/TLS fact unweighted and weighted. Within an IP the fetched
+hosts are the first N in input order, not a random draw, so the weighting is
+model-based: it assumes the first hosts represent the IP's others. With one
+host per IP the weighted interval is a Wilson interval on the Kish effective
+sample size. When any IP has more than one fetched host, both columns use the
+IP as the sampling unit (hosts on one IP share a server and configuration):
+$p = \sum w k / \sum w d$, cluster-robust
+$\mathrm{var} \approx \frac{C}{C-1} \sum_{ip} (w(k - p d))^2 / (\sum w d)^2$,
+Wilson on $n_{eff} = p(1-p)/\mathrm{var}$ (unweighted: $w = 1$). It also
+reports coverage (fetched / resolving hosts) overall, on Cloudflare IPs and
+elsewhere, and a politeness summary. In the link-rot table hosts on IPs that
+never answered (`ip_unreachable`) count as dead, as their IP's first host
+would have under one host per IP; `ip_throttled` and `stopped` hosts were not
+attempted and count as neither dead nor alive.
 
 Applied to the published one-host-per-IP study it shows why the rerun is
 needed: weighting one host per IP up to 27,391 hosts leaves an effective
@@ -218,28 +254,32 @@ per fetched host 0 ms, p90 2.9 s, max 41 s.
 
 `tools/study/estimate.py` models a rerun from the published records: each
 IP fetches min(resolving hosts, budget) hosts and drains at min(2 / site time,
-1 / (connections per site × 250 ms)) sites per second; refused or timed-out
-IPs stop after 5 failures; the rest is bound by the uplink (fixed 160 s plus
-2.3 ms per fetched site, calibrated on the published classic and real runs).
-Site times 1.2 s (http) and 1.8 s (https) are from the live check, where the
-73-host IP finished inside 44.6 s.
+1 / (connections per site × 250 ms)) sites per second; IPs whose sampled host
+refused or timed out (never answered) stop after 5 failures; IPs whose sampled
+host answered only 429/503 drain at one start per (250 ms + 10 s penalty)
+until the throttle breaker stops them after 5 (+1 in flight); CDN IPs have no
+breakers; the rest is bound by the uplink (fixed 160 s plus 2.3 ms per
+fetched site, calibrated on the published classic and real runs). Site times
+1.2 s (http) and 1.8 s (https) are from the live check, where the 73-host IP
+finished inside 44.6 s. Its defaults match the crawler's (`--hosts-per-ip 1`).
 
 | `--hosts-per-ip` | fetched hosts | coverage | CF | non-CF | slowest IP | est. wall |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 113,963 | 27.3% | 31.9% | 26.5% | 5 s | 7.4 min (published: 7.0) |
-| 500 | 322,790 | 77.4% | 99.9% | 73.4% | 450 s | 15.4 min |
-| 1,000 | 331,167 | 79.4% | 99.9% | 75.8% | 900 s | 15.7 min |
-| 2,000 | 341,280 | 81.9% | 99.9% | 78.6% | 1,800 s | 30.3 min |
-| 3,000 | 346,925 | 83.2% | 99.9% | 80.2% | 2,700 s | 45.3 min |
-| unlimited | 375,131 | 90.0% | 99.9% | 88.2% | 16,435 s | 4.6 h |
+| 1 | 113,963 | 27.3% | 31.9% | 26.5% | 10 s | 7.4 min (published: 7.0) |
+| 500 | 322,083 | 77.3% | 100.0% | 73.2% | 450 s | 15.3 min |
+| 1,000 | 330,460 | 79.3% | 100.0% | 75.5% | 900 s | 15.7 min |
+| 2,000 | 340,573 | 81.7% | 100.0% | 78.4% | 1,800 s | 30.3 min |
+| 3,000 | 346,218 | 83.0% | 100.0% | 80.0% | 2,700 s | 45.3 min |
+| unlimited | 374,424 | 89.8% | 100.0% | 88.0% | 16,435 s | 4.6 h |
 
-Coverage tops out near 90% because hosts on IPs that refuse or time out are
-skipped after 5 failures (they are dead at the HTTP level; the attempted ones
-represent them in the weighting). With pessimistic site times (2.2 s / 2.8 s,
-the live medians before subtracting DNS) the 2,000 budget estimates 47 min and
-1,000 estimates 24 min. The slowest IPs at 2,000 are two parking IPs whose
-hosts redirect to hugedomains.com over TLS and two Asian hosting IPs; they
-are bound by 2 connections, not by the spacing.
+Coverage tops out near 90% because hosts on IPs that never answer are skipped
+after 5 failures (they are dead at the HTTP level and count as such in link
+rot) and the 766 IPs whose sampled host answered only 429/503 stop after 6
+attempts. With pessimistic site times (2.2 s / 2.8 s, the live medians before
+subtracting DNS) the 2,000 budget estimates 47 min and 1,000 estimates 24 min.
+The slowest IPs at 2,000 are two parking IPs whose hosts redirect to
+hugedomains.com over TLS and two Asian hosting IPs; they are bound by 2
+connections, not by the spacing.
 
 Recommended for the 1M rerun (~30 min estimated, 341K of 417K resolving hosts,
 every Cloudflare host, never more than 2 connections or 4 starts/s per non-CDN IP):
@@ -249,5 +289,5 @@ build\release\wincrawl.exe --mode real --hosts-per-ip 2000 --record study.jsonl 
 python tools\study\analyze.py study.jsonl --seeds 1000000 > report.md
 ```
 
-If the run must stay well under 45 minutes, `--hosts-per-ip 1000` costs 2.5
+If the run must stay well under 45 minutes, `--hosts-per-ip 1000` costs 2.4
 points of coverage and estimates 16–24 minutes.

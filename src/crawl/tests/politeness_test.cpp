@@ -200,14 +200,38 @@ TEST_CASE("politeness: sites under way queue ahead of new sites") {
     CHECK(order == std::vector<GateWaiter*>{&p1, &p2, &s1, &s2});
 }
 
+// restart() for a holder that connects at its reserved time.
+std::optional<uint32_t> reconnect(IpGates& gates, Events& ev, GateWaiter& w, Outcome outcome, uint64_t now) {
+    const std::optional<uint32_t> ms = gates.restart(kA, outcome, &w, now);
+    if (ms) {
+        gates.started(kA, now + *ms, ev);
+    }
+    return ms;
+}
+
 TEST_CASE("politeness: a holder's reconnect only waits for the spacing") {
     IpGates gates(policy(0, 1, 100), 16);
     Events ev;
-    GateWaiter a;
+    GateWaiter a, h;
     CHECK(gates.seed(kA, &a, 0, ev).admit == Admit::Now);
-    CHECK(gates.restart(kA, Outcome::Replied, 30) == 70u);   // reserved at 100
-    CHECK(gates.restart(kA, Outcome::Replied, 30) == 170u);  // the next one at 200
-    CHECK(gates.restart(kA, Outcome::Replied, 1000) == 0u);
+    CHECK(reconnect(gates, ev, a, Outcome::Replied, 30) == 70u);   // reserved at 100
+    CHECK(reconnect(gates, ev, a, Outcome::Replied, 30) == 170u);  // the next one at 200
+    CHECK(reconnect(gates, ev, a, Outcome::Replied, 1000) == 0u);
+    // A reserved start that has not connected yet: a second reconnect may not
+    // take a time of its own; it queues as a holder (no second slot).
+    CHECK(gates.restart(kA, Outcome::Replied, &a, 1050) == 50u);  // starts at 1100
+    CHECK_FALSE(gates.restart(kA, Outcome::Replied, &h, 1060).has_value());
+    CHECK(h.holder);
+    gates.started(kA, 1100, ev);  // the first connects; the holder is due 100 ms later
+    REQUIRE(ev.timers.size() == 1);
+    CHECK(ev.timers[0].second == 100u);
+    gates.on_timer(kA, 1200, ev);
+    REQUIRE(ev.woken.size() == 1);
+    CHECK(ev.woken[0] == &h);
+    CHECK(h.state == GateWaiter::State::Admitted);
+    // Still one slot: a new site has to wait for a release.
+    GateWaiter c;
+    CHECK(gates.seed(kA, &c, 5000, ev).admit == Admit::Queued);
 }
 
 TEST_CASE("politeness: 429/503 back off the IP, replies relax it") {
@@ -224,17 +248,36 @@ TEST_CASE("politeness: 429/503 back off the IP, replies relax it") {
     CHECK(ev.timers[0].second == 1000u);
     gates.on_timer(kA, 1100, ev);
     REQUIRE(ev.woken.size() == 1);
+    gates.started(kA, 1100, ev);
     // Spacing is now interval + penalty = 200 + 1000.
-    CHECK(gates.restart(kA, Outcome::None, 1100) == 1200u);
+    CHECK(reconnect(gates, ev, b, Outcome::None, 1100) == 1200u);
     // A further throttle doubles the penalty (2000) and pushes the next start
     // out by it; each normal reply halves it again.
-    CHECK(gates.restart(kA, Outcome::Throttled, 10000) == 2000u);
-    CHECK(gates.restart(kA, Outcome::Replied, 100000) == 0u);     // penalty 1000: next at +1200
-    CHECK(gates.restart(kA, Outcome::Replied, 100000) == 1200u);  // penalty 500
-    CHECK(gates.restart(kA, Outcome::Replied, 200000) == 0u);     // penalty 250: next at +450
-    CHECK(gates.restart(kA, Outcome::Replied, 200000) == 450u);   // penalty 125
-    CHECK(gates.restart(kA, Outcome::Replied, 300000) == 0u);     // under 100 ms: gone
-    CHECK(gates.restart(kA, Outcome::Replied, 300000) == 200u);
+    CHECK(reconnect(gates, ev, b, Outcome::Throttled, 10000) == 2000u);
+    CHECK(reconnect(gates, ev, b, Outcome::Replied, 100000) == 0u);     // penalty 1000: next at +1200
+    CHECK(reconnect(gates, ev, b, Outcome::Replied, 100000) == 1200u);  // penalty 500
+    CHECK(reconnect(gates, ev, b, Outcome::Replied, 200000) == 0u);     // penalty 250: next at +450
+    CHECK(reconnect(gates, ev, b, Outcome::Replied, 200000) == 450u);   // penalty 125
+    CHECK(reconnect(gates, ev, b, Outcome::Replied, 300000) == 0u);     // under 100 ms: gone
+    CHECK(reconnect(gates, ev, b, Outcome::Replied, 300000) == 200u);
+}
+
+TEST_CASE("politeness: the penalty is capped") {
+    GatePolicy p = policy(0, 1, 0);
+    p.max_penalty_ms = 3000;
+    p.fail_limit = 0;
+    IpGates gates(p, 16);
+    Events ev;
+    GateWaiter a;
+    CHECK(gates.seed(kA, &a, 0, ev).admit == Admit::Now);
+    uint64_t now = 0;
+    std::optional<uint32_t> ms;
+    for (int i = 0; i < 6; ++i) {  // 1000, 2000, 3000, 3000, ...
+        ms = reconnect(gates, ev, a, Outcome::Throttled, now);
+        REQUIRE(ms.has_value());
+        now += *ms;
+    }
+    CHECK(ms == 3000u);
 }
 
 TEST_CASE("politeness: CDN ranges get their own limits and no back-off") {
@@ -263,34 +306,77 @@ TEST_CASE("politeness: CDN ranges get their own limits and no back-off") {
     CHECK(gates.seed(kA, &w[4], 0, ev).budget == Budget::Over);
 }
 
-TEST_CASE("politeness: an IP that keeps failing is skipped") {
+TEST_CASE("politeness: an IP that never answered is skipped after repeated failures") {
     GatePolicy p = policy(0, 1, 0);
     p.fail_limit = 3;
     IpGates gates(p, 16);
     Events ev;
-    GateWaiter a, queued1, queued2, late;
+    GateWaiter a, q1, q2, w;
     CHECK(gates.seed(kA, &a, 0, ev).admit == Admit::Now);
-    CHECK(gates.seed(kA, &queued1, 0, ev).admit == Admit::Queued);
-    CHECK(gates.seed(kA, &queued2, 0, ev).admit == Admit::Queued);
-    gates.release(kA, Outcome::Failed, false, 0, ev);   // 1; queued1 admitted
-    gates.release(kA, Outcome::Replied, false, 0, ev);  // a reply resets the count; queued2 admitted
-    CHECK(ev.woken.size() == 2);
-    CHECK(gates.seed(kA, &late, 0, ev).admit == Admit::Queued);
-    gates.release(kA, Outcome::Failed, false, 0, ev);  // 1; late admitted
-    CHECK(ev.woken.size() == 3);
-    GateWaiter w1, w2;
-    CHECK(gates.seed(kA, &w1, 0, ev).admit == Admit::Queued);
-    CHECK(gates.seed(kA, &w2, 0, ev).admit == Admit::Queued);
-    gates.release(kA, Outcome::Failed, false, 0, ev);  // 2; w1 admitted
-    gates.release(kA, Outcome::Failed, false, 0, ev);  // 3: dead, w2 woken unreachable
-    REQUIRE(ev.woken.size() == 5);
-    CHECK(ev.woken[3] == &w1);
-    CHECK(w1.state == GateWaiter::State::Admitted);
-    CHECK(ev.woken[4] == &w2);
-    CHECK(w2.state == GateWaiter::State::Unreachable);
+    CHECK(gates.seed(kA, &q1, 0, ev).admit == Admit::Queued);
+    CHECK(gates.seed(kA, &q2, 0, ev).admit == Admit::Queued);
+    CHECK(gates.seed(kA, &w, 0, ev).admit == Admit::Queued);
+    gates.release(kA, Outcome::Failed, false, 0, ev);  // 1; q1 admitted
+    gates.release(kA, Outcome::Failed, true, 0, ev);   // 2; q2 admitted
+    gates.release(kA, Outcome::Failed, true, 0, ev);   // 3: dead, w woken unreachable
+    REQUIRE(ev.woken.size() == 3);
+    CHECK(ev.woken[2] == &w);
+    CHECK(w.state == GateWaiter::State::Unreachable);
     GateWaiter after;
     CHECK(gates.seed(kA, &after, 0, ev).budget == Budget::Unreachable);
     CHECK(gates.acquire(kA, &after, 0, 0, ev) == Admit::Unreachable);
+
+    // An IP that answered once never counts as unreachable (a blip on our
+    // side must not write off its hosts).
+    GateWaiter b;
+    CHECK(gates.seed(kB, &b, 0, ev).admit == Admit::Now);
+    gates.release(kB, Outcome::Replied, false, 0, ev);
+    for (int i = 0; i < 10; ++i) {
+        GateWaiter x;
+        CHECK(gates.seed(kB, &x, 0, ev).admit == Admit::Now);
+        gates.release(kB, Outcome::Failed, false, 0, ev);
+    }
+    CHECK(gates.seed(kB, &b, 0, ev).budget == Budget::Extra);
+}
+
+TEST_CASE("politeness: an IP that keeps answering 429/503 is skipped") {
+    GatePolicy p = policy(0, 1, 0);
+    p.fail_limit = 3;
+    IpGates gates(p, 16);
+    Events ev;
+    GateWaiter a, w;
+    CHECK(gates.seed(kA, &a, 0, ev).admit == Admit::Now);
+    CHECK(reconnect(gates, ev, a, Outcome::Throttled, 0).has_value());
+    CHECK(reconnect(gates, ev, a, Outcome::Replied, 100000).has_value());  // a reply resets the count
+    CHECK(reconnect(gates, ev, a, Outcome::Throttled, 200000).has_value());
+    CHECK(reconnect(gates, ev, a, Outcome::Throttled, 300000).has_value());
+    CHECK(gates.seed(kA, &w, 300000, ev).admit == Admit::Queued);
+    gates.release(kA, Outcome::Throttled, false, 400000, ev);  // 3 in a row
+    REQUIRE(ev.woken.size() == 1);
+    CHECK(ev.woken[0] == &w);
+    CHECK(w.state == GateWaiter::State::Throttled);
+    GateWaiter after;
+    CHECK(gates.seed(kA, &after, 500000, ev).budget == Budget::Throttled);
+    CHECK(gates.acquire(kA, &after, 0, 500000, ev) == Admit::Throttled);
+}
+
+TEST_CASE("politeness: CDN edges are exempt from both breakers") {
+    Ipv4Ranges cdn;
+    std::string error;
+    REQUIRE(cdn.parse("10.0.0.2/32\n", error));
+    GatePolicy p = policy(0, 1, 0);
+    p.cdn = IpLimits{0, 1, 0, false};
+    p.cdn_ranges = &cdn;
+    p.fail_limit = 2;
+    IpGates gates(p, 16);
+    Events ev;
+    for (int i = 0; i < 6; ++i) {
+        GateWaiter x;
+        CHECK(gates.seed(kB, &x, 0, ev).admit == Admit::Now);
+        gates.release(kB, i % 2 == 0 ? Outcome::Failed : Outcome::Throttled, false, 0, ev);
+    }
+    GateWaiter y;
+    CHECK(gates.seed(kB, &y, 0, ev).budget == Budget::Extra);
 }
 
 TEST_CASE("politeness: cancel removes a queued waiter only") {

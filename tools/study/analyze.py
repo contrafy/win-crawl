@@ -110,12 +110,17 @@ def crawl_delay_bucket(seconds: float) -> str:
     return CRAWL_DELAY_BUCKETS[-1][0]
 
 
+# Hosts that resolved but were never attempted: over the IP's budget, on an
+# IP a breaker closed, or left in the queue when the run was stopped.
+NOT_ATTEMPTED = ("ip_budget", "ip_unreachable", "ip_throttled", "stopped")
+
+
 def sampled(r: dict) -> bool:
-    """The host was fetched: it resolved, was within its IP's host budget and
-    its IP was not skipped as unreachable. These hosts carry the HTTP/TLS
-    facts; the other resolving hosts of an IP are represented through the
-    IP's weight."""
-    return r.get("dns") == "ok" and r.get("ip_dup") is False and r.get("skip") not in ("ip_budget", "ip_unreachable")
+    """The host was fetched: it resolved, was within its IP's host budget, its
+    IP was not closed by a breaker and the run did not stop first. These hosts
+    carry the HTTP/TLS facts; the other resolving hosts of an IP are
+    represented through the IP's weight."""
+    return r.get("dns") == "ok" and r.get("ip_dup") is False and r.get("skip") not in NOT_ATTEMPTED
 
 
 def _tls_version(r: dict):
@@ -168,14 +173,18 @@ class IpTally:
 
 @dataclass
 class Weighted:
-    """A fact over fetched hosts: plain counts, and IP-weighted sums with the
-    Kish effective sample size of the weighted denominator."""
+    """A fact over fetched hosts: plain counts, IP-weighted sums, and the
+    cluster-robust sums of squares that treat the IP as the sampling unit
+    (hosts on one IP share a server and its configuration)."""
 
     k: int = 0
     n: int = 0
     wk: float = 0.0
     wn: float = 0.0
     w2n: float = 0.0  # sum of squared weights over the denominator
+    clusters: int = 0  # IPs contributing to the denominator
+    ss_u: float = 0.0  # sum over IPs of (k - p*d)^2, unweighted p
+    ss_w: float = 0.0  # sum over IPs of (w*(k - p*d))^2, weighted p
 
     @property
     def share(self) -> float:
@@ -183,16 +192,41 @@ class Weighted:
 
     @property
     def n_eff(self) -> float:
+        """Kish effective sample size of the weights (hosts independent)."""
         return self.wn * self.wn / self.w2n if self.w2n > 0 else 0.0
 
+    def cluster_n_eff(self, weighted: bool) -> float:
+        """Effective sample size p(1-p)/var with the cluster-robust variance
+        C/(C-1) * sum_ip (w*(k - p*d))^2 / (sum w*d)^2 of the ratio estimator;
+        never more than the hosts in the denominator."""
+        total = self.wn if weighted else float(self.n)
+        p = self.share if weighted else (self.k / self.n if self.n else 0.0)
+        ss = self.ss_w if weighted else self.ss_u
+        cap = self.n_eff if weighted else float(self.n)
+        if self.clusters < 2 or total <= 0 or ss <= 0:
+            return cap
+        var = self.clusters / (self.clusters - 1) * ss / (total * total)
+        return min(cap, p * (1 - p) / var) if var > 0 else cap
 
-def weighted_share(w: Weighted) -> str:
+
+def weighted_share(w: Weighted, clustered: bool = False) -> str:
     """'p% [lo–hi], n_eff N': the weighted share with a Wilson interval on the
-    effective sample size."""
+    effective sample size (cluster-robust when hosts share IPs)."""
     if w.wn <= 0:
         return "n/a"
-    lo, hi = wilson(w.share * w.n_eff, w.n_eff)
-    return f"{100 * w.share:.2f}% [{100 * lo:.2f}–{100 * hi:.2f}], n_eff {w.n_eff:,.0f}"
+    n_eff = w.cluster_n_eff(True) if clustered else w.n_eff
+    lo, hi = wilson(w.share * n_eff, n_eff)
+    return f"{100 * w.share:.2f}% [{100 * lo:.2f}–{100 * hi:.2f}], n_eff {n_eff:,.0f}"
+
+
+def clustered_share(w: Weighted) -> str:
+    """'k / n = p% [lo–hi], n_eff N' with the IP as the sampling unit."""
+    if w.n <= 0:
+        return share(w.k, w.n)
+    p = w.k / w.n
+    n_eff = w.cluster_n_eff(False)
+    lo, hi = wilson(p * n_eff, n_eff)
+    return f"{w.k:,} / {w.n:,} = {100 * p:.2f}% [{100 * lo:.2f}–{100 * hi:.2f}], n_eff {n_eff:,.0f}"
 
 
 @dataclass
@@ -219,6 +253,7 @@ class Stats:
     dns_ok: int = 0
     fetched: int = 0     # sampled(): within the per-IP host budget and attempted
     unique_ips: int = 0  # distinct IPs among fetched hosts
+    multi_host_ips: int = 0  # IPs with more than one fetched host (cluster-robust intervals)
     ip_dup: int = 0      # over the per-IP host budget (ip_dup true)
     skip: Counter = field(default_factory=Counter)
     robots_attempted: int = 0
@@ -477,6 +512,7 @@ def analyze(records: Iterable[dict]) -> Stats:
         if tally.fetched == 0:
             continue
         s.unique_ips += 1
+        s.multi_host_ips += tally.fetched > 1
         w = tally.resolving / tally.fetched
         for i, f in enumerate(s.facts):
             d = tally.den[i]
@@ -487,6 +523,20 @@ def analyze(records: Iterable[dict]) -> Stats:
                 f.wk += w * k
                 f.wn += w * d
                 f.w2n += w * w * d
+    # Cluster-robust variance: the IP is the sampling unit.
+    for i, f in enumerate(s.facts):
+        if f.n == 0:
+            continue
+        pu, pw = f.k / f.n, f.share
+        for tally in s.ips.values():
+            d = tally.den[i]
+            if tally.fetched == 0 or d == 0:
+                continue
+            w = tally.resolving / tally.fetched
+            k = tally.num[i]
+            f.clusters += 1
+            f.ss_u += (k - pu * d) ** 2
+            f.ss_w += (w * (k - pw * d)) ** 2
     return s
 
 
@@ -554,18 +604,30 @@ def render_coverage(md: Md, s: Stats) -> None:
     text += f". Resolving hosts on IPs with no host fetched (no weight possible): {uncovered:,}."
     md.p(text)
     if s.skip:
-        md.counter_table("skipped by politeness (`skip`)", s.skip, s.dns_ok)
+        md.counter_table("not attempted or skipped by politeness (`skip`)", s.skip, s.dns_ok)
+    if s.skip["stopped"]:
+        md.p(f"{s.skip['stopped']:,} resolved hosts were never attempted because the run was stopped; "
+             "they count as resolving (their IP's weight covers them) but not as fetched.")
 
+    clustered = s.multi_host_ips > 0
     md.h(2, "HTTP and TLS facts, IP-weighted")
     md.p(
         "A per-IP host budget samples hosts on shared IPs. Each fetched host is weighted by its IP's "
         "resolving hosts / fetched hosts, so every resolving host counts once (inverse-probability "
-        "weighting); intervals use the Kish effective sample size. With one host per IP (the "
-        "assignment's IP dedupe) the unweighted column describes the first host on each IP."
+        "weighting). Within an IP the fetched hosts are the first ones in input order, not a random "
+        "draw, so the weighting assumes they are representative of the IP (model-based). With one "
+        "host per IP (the assignment's IP dedupe) the unweighted column describes the first host on "
+        "each IP."
     )
+    if clustered:
+        md.p("Hosts on one IP share a server, so intervals treat the IP as the sampling unit: "
+             "cluster-robust variance of the ratio estimator, Wilson on n_eff = p(1-p)/var.")
+    else:
+        md.p("One host per IP: weighted intervals use the Kish effective sample size.")
     md.table(
         ["fact", "unweighted", "IP-weighted"],
-        [[label, share(f.k, f.n), weighted_share(f)] for (label, _, _), f in zip(FACTS, s.facts)],
+        [[label, clustered_share(f) if clustered else share(f.k, f.n), weighted_share(f, clustered)]
+         for (label, _, _), f in zip(FACTS, s.facts)],
     )
     if s.unweightable:
         md.p(f"({s.unweightable:,} fetched hosts have no IP recorded and are left out of both columns.)")
@@ -627,6 +689,7 @@ def render(s: Stats, seeds: int | None = None, title: str = "wincrawl measuremen
     md.h(2, "Link rot")
     dead_dns = s.dns["nxdomain"] + s.dns["noanswer"]
     connect = s.robots_error["connect_fail"]
+    unreachable = s.skip["ip_unreachable"]
     md.table(
         ["outcome", "share of unique hosts"],
         [
@@ -636,14 +699,19 @@ def render(s: Stats, seeds: int | None = None, title: str = "wincrawl measuremen
             ["DNS timeout", share(s.dns["timeout"], s.records)],
             ["resolves, but TCP connect fails (first request)", share(connect, s.records)],
             ["resolves, but first request times out", share(s.robots_error["timeout"], s.records)],
-            ["resolves, IP skipped after repeated failures (not attempted)", share(s.skip["ip_unreachable"], s.records)],
-            ["**dead: NXDOMAIN + no A + connect failure**", share(dead_dns + connect, s.records)],
+            ["resolves, IP never answered (skipped after repeated failures)", share(unreachable, s.records)],
+            ["**dead: NXDOMAIN + no A + connect failure + IP never answered**",
+             share(dead_dns + connect + unreachable, s.records)],
             ["alive: any HTTP reply (robots or page)", share(s.alive, s.records)],
+            ["not attempted: IP kept answering 429/503", share(s.skip["ip_throttled"], s.records)],
+            ["not attempted: run stopped", share(s.skip["stopped"], s.records)],
         ],
     )
     md.p(
         "Hosts over their IP's host budget are not fetched, so 'alive' is bounded by fetched hosts; "
-        f"{share(s.alive, s.fetched)} of fetched hosts answered HTTP."
+        f"{share(s.alive, s.fetched)} of fetched hosts answered HTTP. Hosts on an IP that never "
+        "answered count as dead (by the one-host-per-IP method its first host would have failed the "
+        "same way); hosts not attempted for other reasons count in neither."
     )
     md.counter_table("DNS status", s.dns, s.records)
 

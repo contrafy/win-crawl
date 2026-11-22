@@ -59,7 +59,8 @@ struct Config {
     unsigned ip_interval_ms = 250;    // minimum spacing between connection starts to one IP
     unsigned max_crawl_delay_s = 30;  // real mode: a longer robots.txt Crawl-delay skips the page
     unsigned max_retry_after_s = 30;  // real mode: a 429/503 Retry-After up to this is waited out once
-    unsigned ip_fail_limit = 5;       // consecutive failed connections before an IP counts as unreachable; 0 = never
+    unsigned ip_fail_limit = 5;       // breakers: failed connections (IP never answered) or 429/503s in a row; 0 = never
+    unsigned max_ip_penalty_ms = 10000;  // cap on the 429/503 back-off added to an IP's spacing
     // CDN edges (IPs in cdn_ranges) front many unrelated origins, so per-IP
     // limits protect nothing there; they get their own.
     bool cdn_policy = true;

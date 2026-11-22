@@ -107,7 +107,9 @@ struct SiteRecord {
     uint64_t ms = 0;  // task time, start to record
 
     // Politeness (docs/politeness.md).
-    const char* skip = nullptr;          // "ip_budget" | "ip_unreachable" | "crawl_delay"; nullptr: not skipped
+    // "ip_budget" | "ip_unreachable" | "ip_throttled" | "crawl_delay" | "stopped" (never attempted:
+    // the run was stopped); nullptr: not skipped
+    const char* skip = nullptr;
     uint64_t wait_ms = 0;                // waited on politeness: IP queue and spacing, Crawl-delay, Retry-After
     std::optional<double> crawl_delay;   // Crawl-delay (s) in the seed origin's robots.txt
     uint64_t crawl_delay_ms = 0;         // of wait_ms: waited for a Crawl-delay

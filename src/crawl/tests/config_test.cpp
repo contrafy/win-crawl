@@ -155,11 +155,12 @@ TEST_CASE("config: politeness options and the gate policy they make") {
     CHECK_FALSE(p.cdn.backoff);
     CHECK(p.cdn_ranges == &cloudflare_ipv4());
     CHECK(p.fail_limit == 5);
+    CHECK(p.max_penalty_ms == 10000);
 
     Config all;
     REQUIRE(parse({"--hosts-per-ip", "50", "--ip-concurrency=3", "--ip-interval", "400", "--max-crawl-delay", "10",
                    "--max-retry-after=5", "--ip-fail-limit", "0", "--cdn-ip-concurrency", "8", "--cdn-ip-interval",
-                   "20", "u.txt"},
+                   "20", "--max-ip-penalty", "4000", "u.txt"},
                   all)
                 .status == ParseStatus::Ok);
     CHECK(all.hosts_per_ip == 50);
@@ -173,6 +174,7 @@ TEST_CASE("config: politeness options and the gate policy they make") {
     CHECK(p.cdn.concurrency == 8);
     CHECK(p.cdn.interval_ms == 20);
     CHECK(p.fail_limit == 0);
+    CHECK(p.max_penalty_ms == 4000);
 
     Config nodedupe;
     REQUIRE(parse({"--no-ip-dedupe", "--cdn-hosts-per-ip", "7", "--no-cdn-policy", "u.txt"}, nodedupe).status ==

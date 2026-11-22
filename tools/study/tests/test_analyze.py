@@ -182,7 +182,7 @@ class AnalyzeTest(unittest.TestCase):
             "| seed URLs | 10 |  |",
             "| unique hosts | 8 | 8 / 10 = 80.00% [49.02–94.33] |",
             "| DNS ok | 6 | 6 / 8 = 75.00%",
-            "| **dead: NXDOMAIN + no A + connect failure** | 3 / 8 = 37.50%",
+            "| **dead: NXDOMAIN + no A + connect failure + IP never answered** | 3 / 8 = 37.50%",
             "redirected to https): 2 / 3 = 66.67%",
             "| of TLS 1.3 handshakes | 1 / 1 = 100.00%",
             "| of all https sites (handshake completed) | 1 / 2 = 50.00%",
@@ -260,6 +260,9 @@ class WeightingTest(unittest.TestCase):
         self.assertFalse(analyze.sampled(BUDGET_RECORDS[2]))
         self.assertFalse(analyze.sampled(BUDGET_RECORDS[6]))
         self.assertTrue(analyze.sampled(BUDGET_RECORDS[5]))
+        for skip in ("stopped", "ip_throttled"):
+            self.assertFalse(analyze.sampled(dict(BUDGET_RECORDS[5], skip=skip)))
+        self.assertTrue(analyze.sampled(dict(BUDGET_RECORDS[5], skip="crawl_delay")))
 
     def test_weighted_tls13(self):
         # Unweighted: 4 of 5 handshakes. Weighted: 1.1.1.1's two hosts count
@@ -274,6 +277,18 @@ class WeightingTest(unittest.TestCase):
         self.assertEqual((g.k, g.n), (5, 6))
         self.assertAlmostEqual(g.share, (2 * 2 + 1 + 2) / (2 * 2 + 1 + 3 + 2))
 
+    def test_cluster_robust_intervals(self):
+        # TLS 1.3 by IP (handshakes d, TLS 1.3 k): 1.1.1.1 (2, 1), 2.2.2.2
+        # (1, 1), 104.16.0.9 (2, 2). Unweighted p = 0.8:
+        # var = 3/2 * ((1-1.6)^2 + (1-0.8)^2 + (2-1.6)^2) / 5^2 = 0.0336.
+        labels = [label for label, _, _ in analyze.FACTS]
+        f = self.s.facts[labels.index("TLS 1.3, of completed handshakes")]
+        self.assertEqual(f.clusters, 3)
+        self.assertAlmostEqual(f.ss_u, 0.56)
+        self.assertAlmostEqual(f.cluster_n_eff(False), 0.16 / 0.0336)
+        self.assertLessEqual(f.cluster_n_eff(True), f.n_eff)
+        self.assertEqual(self.s.multi_host_ips, 2)
+
     def test_report(self):
         text = analyze.render(self.s)
         for fragment in [
@@ -281,10 +296,12 @@ class WeightingTest(unittest.TestCase):
             "| on Cloudflare IPs (published ranges) | 2 / 2 = 100.00%",
             "| on other IPs | 4 / 8 = 50.00%",
             "| `ip_budget` | 2 / 10 = 20.00%",
-            "| TLS 1.3, of completed handshakes | 4 / 5 = 80.00% [37.55–96.38] | 71.43% [",
-            "], n_eff 4 |",
+            "| TLS 1.3, of completed handshakes | 4 / 5 = 80.00% [36.71–96.50], n_eff 5 | 71.43% [29.20–93.81], "
+            "n_eff 4 |",
             "the largest carries 4 resolving hosts (2 fetched)",
-            "| resolves, IP skipped after repeated failures (not attempted) | 2 / 10 = 20.00%",
+            "| resolves, IP never answered (skipped after repeated failures) | 2 / 10 = 20.00%",
+            "| **dead: NXDOMAIN + no A + connect failure + IP never answered** | 3 / 10 = 30.00%",
+            "| not attempted: IP kept answering 429/503 | 0 / 10 = 0.00%",
             "waited on politeness (IP queue and spacing, Crawl-delay, Retry-After): 2 / 6 = 33.33%",
             "of fetched hosts whose robots.txt answered 2xx: 1 / 1 = 100.00%",
             "| (0, 1] | 1 / 1 = 100.00%",

@@ -41,9 +41,11 @@ class Model:
     cdn_ip_concurrency: int = 16
     cdn_ip_interval_ms: int = 0
     ip_fail_limit: int = 5
-    # Seconds a site holds its IP's connection slot, by how the sampled host answered.
-    tls_site_s: float = 1.6
-    http_site_s: float = 0.9
+    max_ip_penalty_ms: int = 10000
+    # Seconds a site holds its IP's connection slot, by how the sampled host
+    # answered (live validation run, docs/politeness.md).
+    tls_site_s: float = 1.8
+    http_site_s: float = 1.2
     refused_s: float = 2.0   # Windows retries a refused SYN for ~2 s
     timeout_s: float = 10.0  # --timeout
     # Uplink: fixed seconds (DNS for every host, ramp) + per fetched site.
@@ -63,7 +65,8 @@ class Model:
 class Ip:
     resolving: int = 0
     cf: bool = False
-    replied: bool = False   # some fetched host got an HTTP reply
+    replied: bool = False   # some fetched host got an HTTP reply other than 429/503
+    throttled: bool = False  # some fetched host got 429/503
     tls: bool = False       # ... over https
     redirected: bool = False
     failed: str | None = None  # "refused" / "timeout" when no fetched host replied
@@ -78,13 +81,16 @@ def read_ips(records: Iterable[dict]) -> dict:
         ip = ips.setdefault(r["ip"], Ip())
         ip.resolving += 1
         ip.cf = ip.cf or r.get("cf_ip") is True
-        if r.get("ip_dup") is not False or r.get("skip") in ("ip_budget", "ip_unreachable"):
+        if r.get("ip_dup") is not False or r.get("skip") in ("ip_budget", "ip_unreachable", "ip_throttled", "stopped"):
             continue
-        if r.get("robots_status") is not None or r.get("status") is not None:
+        statuses = [x for x in (r.get("robots_status"), r.get("status")) if x is not None]
+        if any(x in (429, 503) for x in statuses):
+            ip.throttled = True
+        if any(x not in (429, 503) for x in statuses):
             ip.replied = True
             ip.tls = ip.tls or r.get("tls") is not None
             ip.redirected = ip.redirected or bool(r.get("redirects"))
-        elif r.get("robots_error") in ("connect_fail", "timeout") and ip.failed is None:
+        elif not statuses and r.get("robots_error") in ("connect_fail", "timeout") and ip.failed is None:
             ip.failed = "refused" if r["robots_error"] == "connect_fail" else "timeout"
     return ips
 
@@ -113,11 +119,16 @@ def estimate(ips: dict, m: Model, top: int = 5) -> Estimate:
         conc = m.cdn_ip_concurrency if cdn else m.ip_concurrency
         interval = (m.cdn_ip_interval_ms if cdn else m.ip_interval_ms) / 1000.0
         attempted = ip.resolving if budget == 0 else min(ip.resolving, budget)
-        if not ip.replied and ip.failed is not None:
-            # The breaker stops the IP after fail_limit failures (plus what was
-            # already in flight).
-            if m.ip_fail_limit:
-                attempted = min(attempted, m.ip_fail_limit + max(conc, 1) - 1)
+        # The breakers stop an ordinary IP after fail_limit failures (plus what
+        # was already in flight); CDN edges are exempt.
+        breaker = m.ip_fail_limit and not cdn
+        cap = m.ip_fail_limit + max(conc, 1) - 1 if breaker else attempted
+        if not ip.replied and ip.throttled:
+            # Only 429/503: every start waits out the (capped) penalty.
+            attempted = min(attempted, cap)
+            rate = 1.0 / (interval + m.max_ip_penalty_ms / 1000.0) if not cdn else (conc / m.http_site_s if conc else math.inf)
+        elif not ip.replied and ip.failed is not None:
+            attempted = min(attempted, cap)
             per = m.refused_s if ip.failed == "refused" else m.timeout_s
             rate = (conc / per) if conc else math.inf
         else:
@@ -141,7 +152,8 @@ def report(ips: dict, base: Model, budgets: list[int]) -> str:
     lines = [
         f"{len(ips):,} IPs, {sum(i.resolving for i in ips.values()):,} resolving hosts. Policy: "
         f"{base.ip_concurrency} connections / {base.ip_interval_ms} ms per IP; CDN "
-        f"{base.cdn_ip_concurrency} / {base.cdn_ip_interval_ms} ms; unreachable after {base.ip_fail_limit} failures.",
+        f"{base.cdn_ip_concurrency} / {base.cdn_ip_interval_ms} ms; breakers after {base.ip_fail_limit}; "
+        f"429/503 penalty up to {base.max_ip_penalty_ms} ms.",
         "",
         "| --hosts-per-ip | fetched hosts | coverage | CF coverage | non-CF coverage | uplink s | slowest IP s | est. wall |",
         "|---:|---:|---:|---:|---:|---:|---:|---:|",
@@ -161,13 +173,14 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("records", help="wincrawl --record output (JSON lines)")
     d = Model()
-    ap.add_argument("--hosts-per-ip", type=int, default=0)
+    ap.add_argument("--hosts-per-ip", type=int, default=d.hosts_per_ip, help="0 = unlimited (default 1, as wincrawl)")
     ap.add_argument("--ip-concurrency", type=int, default=d.ip_concurrency)
     ap.add_argument("--ip-interval", type=int, default=d.ip_interval_ms)
     ap.add_argument("--cdn-hosts-per-ip", type=int, default=None)
     ap.add_argument("--cdn-ip-concurrency", type=int, default=d.cdn_ip_concurrency)
     ap.add_argument("--cdn-ip-interval", type=int, default=d.cdn_ip_interval_ms)
     ap.add_argument("--ip-fail-limit", type=int, default=d.ip_fail_limit)
+    ap.add_argument("--max-ip-penalty", type=int, default=d.max_ip_penalty_ms)
     ap.add_argument("--tls-site-s", type=float, default=d.tls_site_s)
     ap.add_argument("--http-site-s", type=float, default=d.http_site_s)
     ap.add_argument("--sweep", help="comma-separated --hosts-per-ip values for a table (0 = unlimited)")
@@ -175,7 +188,7 @@ def main(argv: list[str] | None = None) -> int:
     m = Model(hosts_per_ip=args.hosts_per_ip, ip_concurrency=args.ip_concurrency, ip_interval_ms=args.ip_interval,
               cdn_hosts_per_ip=args.cdn_hosts_per_ip, cdn_ip_concurrency=args.cdn_ip_concurrency,
               cdn_ip_interval_ms=args.cdn_ip_interval, ip_fail_limit=args.ip_fail_limit,
-              tls_site_s=args.tls_site_s, http_site_s=args.http_site_s)
+              max_ip_penalty_ms=args.max_ip_penalty, tls_site_s=args.tls_site_s, http_site_s=args.http_site_s)
     with open(args.records, encoding="utf-8") as f:
         ips = read_ips(json.loads(line) for line in f if line.strip())
     if args.sweep:

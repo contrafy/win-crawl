@@ -512,13 +512,19 @@ TEST_CASE("polite: a huge IP does not starve the loop, and Ctrl+C drains its que
     const uint64_t big_ip_fetched = rig.track(1).accepts;
     CHECK(big_ip_fetched < 60);
     CHECK(engine.records_written() == 350);  // queued hosts still get a record
+    // Never attempted because of the stop: marked apart, not as failures.
+    CHECK(s[Counter::StoppedHosts] >= 300 - big_ip_fetched - 1);
+    CHECK(s[Counter::RobotsAttempted] + s[Counter::StoppedHosts] <= 350);
     std::ifstream in(cfg.record_path, std::ios::binary);
     std::string line;
-    size_t aborted = 0;
+    size_t stopped = 0;
     while (std::getline(in, line)) {
-        aborted += has(line, "\"robots_error\":\"aborted\"") ? 1 : 0;
+        if (has(line, "\"skip\":\"stopped\"")) {
+            ++stopped;
+            CHECK(has(line, "\"robots_error\":null"));
+        }
     }
     in.close();
     DeleteFileA(cfg.record_path.c_str());
-    CHECK(aborted >= 300 - big_ip_fetched - 1);
+    CHECK(stopped == s[Counter::StoppedHosts]);
 }

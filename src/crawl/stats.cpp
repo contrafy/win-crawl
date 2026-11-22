@@ -19,7 +19,7 @@ constexpr const char* kCounterNames[kCounterCount] = {
     "dns_retries",     "dns_timeouts",
     "ip_extra_hosts",  "ip_budget_skips",    "ip_unreachable",   "ip_busy",     "cdn_hosts",
     "polite_waits",    "polite_wait_ms",     "crawl_delay_waits", "crawl_delay_ms", "crawl_delay_skips",
-    "throttled",       "retry_after_retries",
+    "throttled",       "retry_after_retries", "ip_throttled", "stopped_hosts",
     "inflight",        "polite_waiting",
 };
 
@@ -117,9 +117,13 @@ std::string format_summary(const Snapshot& s, const RunInfo& info) {
     appendf(out, "Peak in-flight %llu\n", u(info.peak_inflight));
     appendf(out,
             "Politeness: %llu hosts beyond the first per IP, %llu skipped by the per-IP budget, %llu on unreachable "
-            "IPs, %llu redirects refused (busy or unreachable IP); %llu waits (%.1f s)\n",
+            "IPs, %llu on throttling IPs, %llu redirects refused (busy or closed IP); %llu waits (%.1f s)\n",
             u(s[Counter::IpExtraHosts]), u(s[Counter::IpBudgetSkips]), u(s[Counter::IpUnreachable]),
-            u(s[Counter::IpBusy]), u(s[Counter::PoliteWaits]), static_cast<double>(s[Counter::PoliteWaitMs]) / 1000.0);
+            u(s[Counter::IpThrottled]), u(s[Counter::IpBusy]), u(s[Counter::PoliteWaits]),
+            static_cast<double>(s[Counter::PoliteWaitMs]) / 1000.0);
+    if (s[Counter::StoppedHosts] != 0) {
+        appendf(out, "Stopped before attempting %llu resolved hosts\n", u(s[Counter::StoppedHosts]));
+    }
     appendf(out, "Crawl-delay: %llu waits (%.1f s), %llu pages skipped; 429/503 replies %llu, Retry-After retries %llu\n",
             u(s[Counter::CrawlDelayWaits]), static_cast<double>(s[Counter::CrawlDelayMs]) / 1000.0,
             u(s[Counter::CrawlDelaySkips]), u(s[Counter::Throttled]), u(s[Counter::RetryAfterRetries]));

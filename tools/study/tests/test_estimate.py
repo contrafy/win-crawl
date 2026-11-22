@@ -73,6 +73,28 @@ class EstimateTest(unittest.TestCase):
         self.assertAlmostEqual(e.slowest_s, 10.0)
         self.assertEqual(e.fetched["cf"], 30)  # CDN IPs: unlimited unless --hosts-per-ip is 1
 
+    def test_throttling_ip(self):
+        # 50 hosts on an IP whose sampled host got 429: each start waits out
+        # the capped penalty until the throttle breaker stops it.
+        records = [rec("9.9.9.9", False, robots_status=429)] + [rec("9.9.9.9", True)] * 49
+        ips = estimate.read_ips(records)
+        self.assertTrue(ips["9.9.9.9"].throttled)
+        self.assertFalse(ips["9.9.9.9"].replied)
+        m = estimate.Model(hosts_per_ip=0, ip_interval_ms=250, max_ip_penalty_ms=10000, ip_fail_limit=5,
+                           fixed_s=0, site_cost_ms=0, tail_s=0)
+        e = estimate.estimate(ips, m)
+        self.assertEqual(e.fetched["other"], 6)  # 5 + the one in flight
+        self.assertAlmostEqual(e.slowest_s, 6 * 10.25)
+        # Without the breaker it would drain at one host per 10.25 s.
+        m.ip_fail_limit = 0
+        self.assertAlmostEqual(estimate.estimate(ips, m).slowest_s, 50 * 10.25)
+
+    def test_cdn_ip_has_no_breaker(self):
+        records = [rec("104.16.0.2", False, cf=True, robots_error="connect_fail")] + \
+                  [rec("104.16.0.2", True, cf=True)] * 39
+        e = estimate.estimate(estimate.read_ips(records), estimate.Model(hosts_per_ip=0))
+        self.assertEqual(e.fetched["cf"], 40)
+
     def test_cli_sweep(self):
         fd, path = tempfile.mkstemp(suffix=".jsonl")
         with os.fdopen(fd, "w", encoding="utf-8") as f:
