@@ -86,7 +86,7 @@ the same keys in the same order.
 | `bytes` | int | decoded body bytes of the last page reply |
 | `links` | int | links extracted from it (2xx `text/html` / `application/xhtml+xml` only in real mode, any 2xx in classic) |
 | `ms` | int | milliseconds from the task start (input line claimed) to the record, DNS queueing included |
-| `skip` | string | why politeness skipped the host or its page: `ip_budget`, `ip_unreachable`, `crawl_delay`; null otherwise ([`politeness.md`](politeness.md)) |
+| `skip` | string | why the host or its page was not fetched: `ip_budget`, `ip_unreachable` (IP never answered), `ip_throttled` (IP kept answering 429/503), `stopped` (never attempted, run stopped), `crawl_delay`; null otherwise ([`politeness.md`](politeness.md)) |
 | `wait_ms` | int | time the site waited on politeness (IP queue and spacing, Crawl-delay, Retry-After) |
 | `crawl_delay` | number | Crawl-delay (seconds) in the seed origin's robots.txt |
 | `crawl_delay_ms` | int | the part of `wait_ms` spent on Crawl-delay |
@@ -98,7 +98,8 @@ Fetch errors: `connect_fail` (refused, unreachable, or `--connect-timeout`),
 `tls_certificate` (rejected by offline chain verification), `too_large`,
 `bad_reply` (not HTTP/1.x), `closed` (reset or EOF before a complete reply),
 `no_ports` (ephemeral ports exhausted after ~15 s of retries), `aborted`
-(Ctrl+C).
+(Ctrl+C while the fetch was under way; sites never attempted carry
+`skip: "stopped"` instead).
 
 `tls` object:
 
@@ -181,7 +182,10 @@ across all loops. Rig: `wincrawl-benchd serve --dns 127.0.0.1:35300 --http
   robots allowed → page attempted → page reply → final 2xx, each as a share of
   the previous stage;
 - link rot: NXDOMAIN, no A record, SERVFAIL, DNS timeout, connect failure and
-  timeout on the first request, as shares of unique hosts;
+  timeout on the first request, as shares of unique hosts; hosts on IPs that
+  never answered (`skip: "ip_unreachable"`) count as dead, hosts not
+  attempted (`ip_throttled`, `stopped`) are listed separately and count as
+  neither dead nor alive;
 - http→https upgrade share, redirect count distribution, fetch outcomes;
 - final and robots.txt status distributions;
 - TLS handshake outcomes, versions, groups, ciphers; post-quantum hybrid share
@@ -196,7 +200,11 @@ across all loops. Rig: `wincrawl-benchd serve --dns 127.0.0.1:35300 --http
 
 Every share is `k / n = p% [lo–hi]` with the Wilson score 95% interval. Each
 denominator is the population the fact can be observed on (e.g. HSTS: last
-replies over https; PQ: completed TLS handshakes), named in the row.
+replies over https; PQ: completed TLS handshakes), named in the row. With a
+per-IP host budget above 1 the HTTP/TLS facts are also reported IP-weighted,
+and their intervals treat the IP as the sampling unit (cluster-robust; see
+[`politeness.md`](politeness.md#analysis-ip-weighting)). The fetched hosts of
+an IP are its first N in input order, so the weighting is model-based.
 
 ## Validation sample
 

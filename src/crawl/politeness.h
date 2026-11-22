@@ -6,19 +6,25 @@
 //   - the per-IP host budget (--hosts-per-ip; 1 = the assignment's IP dedupe);
 //   - a cap on concurrent connections to the IP and a minimum spacing between
 //     connection starts to it;
-//   - a back-off penalty after 429/503 replies that lengthens that spacing;
-//   - a breaker: after N consecutive failed connections (connect failure or
-//     timeout, no reply) the IP counts as unreachable and its remaining hosts
-//     are skipped instead of each burning a connect timeout.
-// IPs inside the configured CDN ranges get their own limits: per-IP caps
-// protect origin servers, and an anycast edge fronts many unrelated origins.
+//   - a back-off penalty after 429/503 replies that lengthens that spacing,
+//     capped (--max-ip-penalty) so an intermittently throttling IP keeps moving;
+//   - two breakers, each tripping after N in a row: failed connections
+//     (connect failure or timeout) on an IP that never answered HTTP count it
+//     as unreachable, and 429/503 replies count it as throttling; either way
+//     its remaining hosts are skipped instead of each burning a timeout or a
+//     penalty period.
+// IPs inside the configured CDN ranges get their own limits and no breakers:
+// per-IP caps protect origin servers, and an anycast edge fronts many
+// unrelated origins.
 //
 // Waiting: a connection the gate cannot admit right away queues in the gate's
 // FIFO as a GateWaiter that the caller owns. Whoever frees room later (a
 // release on any loop, or a spacing timer) pops it under the shard lock and
 // reports it through GateEvents after unlocking; the engine forwards it to
 // the loop that owns the waiter. Sites already under way queue ahead of new
-// sites, so a site that started finishes before the IP takes on more work.
+// sites, so a site that started finishes before the IP takes on more work. A
+// site reconnecting to its IP keeps its slot; if the IP's previous start has
+// not connected yet it queues as a "holder" that is admitted without a slot.
 //
 // The gate clock (gate_clock_ms) is QueryPerformanceCounter based, finer than
 // the loops' 15.6 ms tick: a timer that fires early just re-arms, so spacing
@@ -46,8 +52,12 @@ struct GatePolicy {
     IpLimits ip;
     IpLimits cdn;
     const Ipv4Ranges* cdn_ranges = nullptr;  // IPs in these ranges use `cdn`; null: none do
-    uint32_t fail_limit = 5;                 // consecutive failed connections before an IP is unreachable; 0 = never
-    uint32_t max_penalty_ms = 60000;         // cap on the 429/503 back-off penalty
+    // Breakers (ordinary IPs only; a CDN edge fronts unrelated origins):
+    // after this many failed connections in a row on an IP that never
+    // answered, it is unreachable; after this many 429/503 replies in a row,
+    // it is throttling us. Either way its remaining hosts are skipped. 0 = never.
+    uint32_t fail_limit = 5;
+    uint32_t max_penalty_ms = 10000;  // cap on the 429/503 back-off penalty (--max-ip-penalty)
 };
 
 // Monotonic milliseconds for gate decisions (QueryPerformanceCounter).
@@ -61,7 +71,8 @@ struct GateWaiter {
         Idle,         // not at any gate
         Queued,       // in a gate's FIFO
         Admitted,     // woken with a connection slot: the owner must release() it
-        Unreachable,  // woken because the IP's breaker tripped: holds nothing
+        Unreachable,  // woken because the IP's breaker tripped: holds nothing new
+        Throttled,    // woken because the IP kept answering 429/503: holds nothing new
         Cancelled,    // removed by cancel()
     };
     GateWaiter* prev = nullptr;
@@ -69,6 +80,7 @@ struct GateWaiter {
     uint32_t ip = 0;
     State state = State::Idle;
     bool priority = false;
+    bool holder = false;  // restart(): already holds a slot, waits only for the spacing
 };
 
 // Callbacks of a gate decision, made on the deciding thread after the shard
@@ -89,22 +101,24 @@ enum class Budget : uint8_t {
     First,        // the first host of this IP
     Extra,        // a further host within the budget
     Over,         // the IP's host budget is spent: skip the host (IP dedupe)
-    Unreachable,  // the IP's breaker tripped: skip the host
+    Unreachable,  // the IP never answered and its breaker tripped: skip the host
+    Throttled,    // the IP kept answering 429/503: skip the host
 };
 
 enum class Admit : uint8_t {
     Now,          // holds a connection slot: connect, later release()
     Queued,       // waiter queued; GateEvents::on_wake reports the outcome
     Busy,         // acquire(): too many sites already wait at this IP
-    Unreachable,  // the IP's breaker tripped
+    Unreachable,  // the IP's unreachable breaker tripped
+    Throttled,    // the IP's throttle breaker tripped
 };
 
 // How the connection that is being released (or replaced) went.
 enum class Outcome : uint8_t {
     None,       // nothing conclusive (aborted, TLS failure, reset, local port shortage)
     Replied,    // the server answered (any status but 429/503): relaxes the back-off
-    Failed,     // connect failure or timeout without any reply: counts toward the breaker
-    Throttled,  // 429 or 503: the IP's spacing backs off
+    Failed,     // connect failure or timeout without any reply: counts toward the unreachable breaker
+    Throttled,  // 429 or 503: the IP's spacing backs off; counts toward the throttle breaker
 };
 
 struct SeedResult {
@@ -133,9 +147,12 @@ public:
     Admit acquire(uint32_t ip, GateWaiter* waiter, uint32_t max_waiters, uint64_t now, GateEvents& events);
 
     // The holder of a slot at `ip` closed its connection (`outcome`) and opens
-    // another one there. Returns how long to wait before connecting; that
-    // start is reserved, and the caller reports started() when it connects.
-    uint32_t restart(uint32_t ip, Outcome outcome, uint64_t now);
+    // another one there. Returns how long to wait before connecting (that
+    // start is reserved; the caller reports started() when it connects), or
+    // nullopt when another admitted start has not connected yet: then
+    // `waiter` (marked as a holder) queues ahead of new sites and is woken
+    // Admitted without taking a second slot.
+    std::optional<uint32_t> restart(uint32_t ip, Outcome outcome, GateWaiter* waiter, uint64_t now);
 
     // A slot that came through a wake (Admitted) or restart() connected now.
     // Until then no other connection starts at the IP while spacing is in

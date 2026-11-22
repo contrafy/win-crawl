@@ -103,6 +103,8 @@ struct Waiter : GateWaiter {
     std::string_view line;    // new site: its input line (lives in the input)
     uint64_t start_ms = 0;    // new site: when its URL was claimed (loop clock)
     uint64_t queued_ms = 0;   // new site: when it started waiting (loop clock)
+    bool first = false;       // new site: the first host charged to its IP's budget
+    bool cdn = false;         // new site: its IP uses the CDN limits
     bool in_use = false;      // new site: taken from the pool
 };
 
@@ -243,8 +245,11 @@ private:
     void send();
     void wait(uint32_t ms, WaitFor why);
     void end_wait();
+    void arm_wait(uint32_t ms);
     void refused(Admit admit);
     void release_slot();
+    void skip_closed_ip(bool throttled);
+    void count_fetched(bool first, bool cdn);
     void note_aborted();
     void finish();
     void complete();
@@ -289,9 +294,10 @@ private:
     uint64_t wait_start_ = 0;
     std::string delay_host_;       // the host whose robots.txt asked for a Crawl-delay
     uint32_t delay_ms_ = 0;
-    uint64_t next_request_ms_ = 0; // earliest next request to delay_host_ (loop clock)
+    uint64_t next_request_ms_ = 0; // earliest next request to delay_host_ (gate clock)
     bool delay_skip_ = false;      // Crawl-delay above the cap: skip the page
     bool retried_ = false;         // the one Retry-After retry is spent
+    bool rerequest_ = false;       // the next acquire repeats a request after a wait (no redirect cap)
 
     // --record
     SiteRecord rec_;
@@ -323,6 +329,7 @@ void Task::reset(std::string_view line) {
     next_request_ms_ = 0;
     delay_skip_ = false;
     retried_ = false;
+    rerequest_ = false;
 }
 
 void Task::begin_record() {
@@ -373,19 +380,33 @@ void Task::resume(const Waiter& seed) {
         rec_.wait_ms += waited;
     }
     if (seed.state != GateWaiter::State::Admitted) {
-        // The IP's breaker tripped while this site waited.
-        w_.stats_.add(Counter::IpUnreachable);
-        if (rec_active_) {
-            rec_.skip = "ip_unreachable";
-        }
+        // A breaker tripped while this site waited.
+        skip_closed_ip(seed.state == GateWaiter::State::Throttled);
         query_https_rr();
         finish();
         return;
     }
     hold_slot(seed.ip, true);
-    w_.stats_.add(Counter::RobotsAttempted);
+    count_fetched(seed.first, seed.cdn);
     query_https_rr();
     start_robots();
+}
+
+void Task::skip_closed_ip(bool throttled) {
+    w_.stats_.add(throttled ? Counter::IpThrottled : Counter::IpUnreachable);
+    if (rec_active_) {
+        rec_.skip = throttled ? "ip_throttled" : "ip_unreachable";
+    }
+}
+
+// Unique IPs and extra hosts count hosts actually fetched, not budget charges.
+void Task::count_fetched(bool first, bool cdn) {
+    CounterBlock& st = w_.stats_;
+    st.add(first ? Counter::UniqueIps : Counter::IpExtraHosts);
+    if (cdn) {
+        st.add(Counter::CdnHosts);
+    }
+    st.add(Counter::RobotsAttempted);
 }
 
 void Task::resolve(Phase phase, const std::string& host) {
@@ -462,28 +483,32 @@ void Task::admit_seed(uint32_t ip) {
     seed->start_ms = start_ms_;
     seed->queued_ms = w_.loop_.now();
     const SeedResult r = w_.gates_.seed(ip, seed, gate_clock_ms(), w_);
-    if (r.budget == Budget::Over || r.budget == Budget::Unreachable) {
+    if (r.budget == Budget::Over) {
         w_.give_seed(seed);
-        const bool over = r.budget == Budget::Over;
-        st.add(over ? Counter::IpBudgetSkips : Counter::IpUnreachable);
+        st.add(Counter::IpBudgetSkips);
         if (rec_active_) {
-            rec_.ip_dup = over;
-            rec_.skip = over ? "ip_budget" : "ip_unreachable";
+            rec_.ip_dup = true;
+            rec_.skip = "ip_budget";
         }
         query_https_rr();  // DNS-level facts cover every resolving host
         finish();
         return;
     }
-    st.add(r.budget == Budget::First ? Counter::UniqueIps : Counter::IpExtraHosts);
-    if (r.cdn) {
-        st.add(Counter::CdnHosts);
-    }
     if (rec_active_) {
         rec_.ip_dup = false;
+    }
+    if (r.budget == Budget::Unreachable || r.budget == Budget::Throttled) {
+        w_.give_seed(seed);
+        skip_closed_ip(r.budget == Budget::Throttled);
+        query_https_rr();
+        finish();
+        return;
     }
     if (r.admit == Admit::Queued) {
         // Wait without a task: once the gate admits the site, the loop
         // resumes it in a free task, which writes its record.
+        seed->first = r.budget == Budget::First;
+        seed->cdn = r.cdn;
         st.add(Counter::PoliteWaits);
         rec_active_ = false;
         phase_ = Phase::Idle;
@@ -493,7 +518,7 @@ void Task::admit_seed(uint32_t ip) {
     }
     w_.give_seed(seed);
     hold_slot(ip, false);
-    st.add(Counter::RobotsAttempted);
+    count_fetched(r.budget == Budget::First, r.cdn);
     query_https_rr();
     start_robots();
 }
@@ -565,10 +590,12 @@ void Task::send() {
     const uint32_t ip = robots ? robots_ip_ : page_ip_;
     const Endpoint ep = endpoint(url, ip);
     const uint64_t now = w_.loop_.now();
-    if (delay_ms_ != 0 && now < next_request_ms_ && url.host == delay_host_) {
+    const uint64_t delay_now = delay_ms_ != 0 && url.host == delay_host_ ? gate_clock_ms() : next_request_ms_;
+    if (delay_now < next_request_ms_) {
         release_slot();
+        rerequest_ = true;  // the same request again later: not a redirect hop
         w_.stats_.add(Counter::CrawlDelayWaits);
-        wait(static_cast<uint32_t>(next_request_ms_ - now), WaitFor::CrawlDelay);
+        wait(static_cast<uint32_t>(next_request_ms_ - delay_now), WaitFor::CrawlDelay);
         return;
     }
     if (conn_.reuses(ep)) {
@@ -581,13 +608,22 @@ void Task::send() {
         // IP): concurrency is unchanged, only the spacing applies.
         if (!reserved_) {
             conn_.close();
-            const uint32_t ms = w_.gates_.restart(ip, outcome_, gate_clock_ms());
+            const std::optional<uint32_t> ms = w_.gates_.restart(ip, outcome_, &wait_, gate_clock_ms());
             outcome_ = Outcome::None;
+            if (!ms) {
+                // Another start at this IP has not connected yet: queue
+                // (keeping the slot) until it has and the spacing has passed.
+                w_.stats_.add(Counter::PoliteWaits);
+                hold_ = Hold::Gate;
+                wait_start_ = now;
+                w_.park(parked_);
+                return;
+            }
             reserved_ = true;
             start_pending_ = true;
-            if (ms != 0) {
+            if (*ms != 0) {
                 w_.stats_.add(Counter::PoliteWaits);
-                wait(ms, WaitFor::Spacing);
+                wait(*ms, WaitFor::Spacing);
                 return;
             }
         }
@@ -602,7 +638,11 @@ void Task::send() {
     // Another IP: give the old slot back before asking for one there, so a
     // task never waits while holding a slot.
     release_slot();
-    const Admit admit = w_.gates_.acquire(ip, &wait_, kMaxHopWaiters, gate_clock_ms(), w_);
+    // Redirect hops may wait behind at most kMaxHopWaiters others; the same
+    // request repeated after a Crawl-delay or Retry-After wait may not be refused.
+    const uint32_t cap = rerequest_ ? 0 : kMaxHopWaiters;
+    rerequest_ = false;
+    const Admit admit = w_.gates_.acquire(ip, &wait_, cap, gate_clock_ms(), w_);
     switch (admit) {
     case Admit::Now:
         hold_slot(ip, false);
@@ -617,6 +657,7 @@ void Task::send() {
         return;
     case Admit::Busy:
     case Admit::Unreachable:
+    case Admit::Throttled:
         refused(admit);
         return;
     }
@@ -627,8 +668,21 @@ void Task::wait(uint32_t ms, WaitFor why) {
     wait_for_ = why;
     wait_start_ = w_.loop_.now();
     w_.park(parked_);
+    arm_wait(ms);
+}
+
+void Task::arm_wait(uint32_t ms) {
     wait_timer_ = w_.loop_.add_timer(ms, [this] {
         wait_timer_ = 0;
+        // Loop timers tick every 15.6 ms and can fire early; a Crawl-delay is
+        // never shortened, so an early timer re-arms for the rest.
+        if (wait_for_ == WaitFor::CrawlDelay) {
+            const uint64_t now = gate_clock_ms();
+            if (now < next_request_ms_) {
+                arm_wait(static_cast<uint32_t>(next_request_ms_ - now));
+                return;
+            }
+        }
         end_wait();
         send();
     });
@@ -673,16 +727,16 @@ void Task::on_gate(GateWaiter::State state) {
         return;
     }
     if (state != GateWaiter::State::Admitted) {
-        refused(Admit::Unreachable);
+        refused(state == GateWaiter::State::Throttled ? Admit::Throttled : Admit::Unreachable);
         return;
     }
     send();
 }
 
-// The gate turned a connection of a site under way down: a redirect to an IP
-// that is unreachable or has too many sites waiting.
+// The gate turned a connection of a site under way down: an IP that is
+// unreachable, throttling us, or has too many redirected sites waiting.
 void Task::refused(Admit admit) {
-    const char* why = admit == Admit::Busy ? "ip_busy" : "ip_unreachable";
+    const char* why = admit == Admit::Busy ? "ip_busy" : admit == Admit::Throttled ? "ip_throttled" : "ip_unreachable";
     w_.stats_.add(Counter::IpBusy);
     if (phase_ == Phase::Robots && funnel_) {
         if (rec_active_) {
@@ -731,7 +785,7 @@ void Task::on_fetch(Connection&, const FetchResult& result) {
     // Crawl-delay spaces every request to the host that asked for it.
     const parse::Url& url = phase_ == Phase::Robots ? robots_ : page_;
     if (delay_ms_ != 0 && url.host == delay_host_) {
-        next_request_ms_ = w_.loop_.now() + delay_ms_;
+        next_request_ms_ = gate_clock_ms() + delay_ms_;
     }
     if (phase_ == Phase::Robots) {
         on_robots(result);
@@ -802,6 +856,7 @@ bool Task::retry_after(const FetchResult& result) {
     }
     w_.stats_.add(Counter::RetryAfterRetries);
     release_slot();
+    rerequest_ = true;
     wait(static_cast<uint32_t>(*s * 1000), WaitFor::RetryAfter);
     return true;
 }
@@ -823,7 +878,7 @@ void Task::note_crawl_delay() {
     }
     delay_host_.assign(robots_.host);
     delay_ms_ = static_cast<uint32_t>(std::ceil(*delay * 1000.0));
-    next_request_ms_ = w_.loop_.now() + delay_ms_;
+    next_request_ms_ = gate_clock_ms() + delay_ms_;
 }
 
 void Task::on_robots(const FetchResult& result) {
@@ -1436,9 +1491,10 @@ void Worker::end_seed(Waiter* waiter) {
         gates_.release(waiter->ip, Outcome::None, true, gate_clock_ms(), *this);
     }
     const bool unreachable = waiter->state == GateWaiter::State::Unreachable;
-    if (unreachable) {
-        stats_.add(Counter::IpUnreachable);
-    }
+    const bool throttled = waiter->state == GateWaiter::State::Throttled;
+    // Admitted or still queued: never attempted because of the stop, which
+    // says nothing about the host. Marked apart so analyses can leave it out.
+    stats_.add(unreachable ? Counter::IpUnreachable : throttled ? Counter::IpThrottled : Counter::StoppedHosts);
     if (recording_) {
         SiteRecord& r = scratch_;
         r.clear();
@@ -1452,11 +1508,7 @@ void Worker::end_seed(Waiter* waiter) {
         r.ip = waiter->ip;
         r.cf_ip = cloudflare_ipv4().contains(waiter->ip);
         r.ip_dup = false;
-        if (unreachable) {
-            r.skip = "ip_unreachable";
-        } else {
-            r.robots_error = fetch_error_name(FetchError::Aborted);
-        }
+        r.skip = unreachable ? "ip_unreachable" : throttled ? "ip_throttled" : "stopped";
         if (cfg_.https_rr) {
             r.https_rr.status = "cancelled";
         }

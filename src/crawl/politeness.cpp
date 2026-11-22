@@ -50,9 +50,12 @@ struct IpGates::Gate {
     uint32_t unstarted = 0;  // admitted through a wake or restart(), not connected yet
     uint32_t prio_waiting = 0;
     uint32_t penalty_ms = 0;
-    uint16_t fails = 0;  // consecutive failed connections
+    uint16_t fails = 0;      // consecutive failed connections
+    uint16_t throttles = 0;  // consecutive 429/503 replies
     bool cdn = false;
-    bool dead = false;
+    bool replied = false;    // the IP has answered at least once: never "unreachable"
+    bool dead = false;       // unreachable breaker tripped
+    bool throttled_out = false;  // throttle breaker tripped
     bool timer_armed = false;
 };
 
@@ -173,6 +176,7 @@ void IpGates::enqueue(Gate& gate, GateWaiter* waiter, bool priority) {
     waiter->ip = gate.ip;
     waiter->state = GateWaiter::State::Queued;
     waiter->priority = priority;
+    waiter->holder = false;
     GateWaiter* after = priority ? gate.prio_tail : gate.tail;
     waiter->prev = after;
     waiter->next = after != nullptr ? after->next : gate.head;
@@ -220,10 +224,18 @@ void IpGates::note(Gate& gate, Outcome outcome, uint64_t now) {
         break;
     case Outcome::Replied:
         gate.fails = 0;
+        gate.throttles = 0;
+        gate.replied = true;
         // Each normal reply halves the penalty again.
         gate.penalty_ms = gate.penalty_ms / 2 < 100 ? 0 : gate.penalty_ms / 2;
         break;
     case Outcome::Failed:
+        // Only an IP that never answered can be declared unreachable: one
+        // that did may be suffering a blip on our side (an uplink hiccup
+        // must not write off thousands of hosts). CDN edges are exempt.
+        if (gate.cdn || gate.replied) {
+            break;
+        }
         if (gate.fails < UINT16_MAX) {
             ++gate.fails;
         }
@@ -233,8 +245,17 @@ void IpGates::note(Gate& gate, Outcome outcome, uint64_t now) {
         break;
     case Outcome::Throttled: {
         gate.fails = 0;
+        gate.replied = true;
         if (!lim.backoff) {
             break;  // CDN edge: one origin's rate limit says nothing about the others
+        }
+        // An IP that answers nothing but 429/503 would otherwise drain at
+        // one host per maximum penalty, forever.
+        if (gate.throttles < UINT16_MAX) {
+            ++gate.throttles;
+        }
+        if (policy_.fail_limit != 0 && gate.throttles >= policy_.fail_limit) {
+            gate.throttled_out = true;
         }
         // The spacing doubles (from at least 1 s) and the next start waits it
         // out. A Retry-After is not applied to the whole IP: on shared
@@ -260,15 +281,17 @@ uint32_t IpGates::dispatch(Gate& gate, uint64_t now, GateWaiter*& woken) {
         }
         tail = w;
     };
-    if (gate.dead) {
+    if (gate.dead || gate.throttled_out) {
+        const auto state = gate.dead ? GateWaiter::State::Unreachable : GateWaiter::State::Throttled;
         while (GateWaiter* w = gate.head) {
             unlink(gate, w);
-            w->state = GateWaiter::State::Unreachable;
+            w->state = state;
             append(w);
         }
         return 0;
     }
-    while (gate.head != nullptr && has_room(gate)) {
+    // A holder (restart()) already has its slot and waits only for the spacing.
+    while (gate.head != nullptr && (gate.head->holder || has_room(gate))) {
         if (start_blocked(gate)) {
             return 0;  // started() dispatches again
         }
@@ -282,7 +305,11 @@ uint32_t IpGates::dispatch(Gate& gate, uint64_t now, GateWaiter*& woken) {
         GateWaiter* w = gate.head;
         unlink(gate, w);
         w->state = GateWaiter::State::Admitted;
-        admit(gate, now);
+        if (w->holder) {
+            gate.next_ms = std::max(gate.next_ms, now) + spacing(gate);
+        } else {
+            admit(gate, now);
+        }
         ++gate.unstarted;  // its owner loop connects later
         append(w);
     }
@@ -315,8 +342,8 @@ SeedResult IpGates::seed(uint32_t ip, GateWaiter* waiter, uint64_t now, GateEven
             result.budget = Budget::Over;
             return result;
         }
-        if (gate.dead) {
-            result.budget = Budget::Unreachable;
+        if (gate.dead || gate.throttled_out) {
+            result.budget = gate.dead ? Budget::Unreachable : Budget::Throttled;
             return result;
         }
         result.budget = gate.hosts == 0 ? Budget::First : Budget::Extra;
@@ -341,8 +368,8 @@ Admit IpGates::acquire(uint32_t ip, GateWaiter* waiter, uint32_t max_waiters, ui
         Shard& shard = shard_of(ip);
         ShardLock lock(shard.lock);
         Gate& gate = shard.get(ip, policy_);
-        if (gate.dead) {
-            return Admit::Unreachable;
+        if (gate.dead || gate.throttled_out) {
+            return gate.dead ? Admit::Unreachable : Admit::Throttled;
         }
         // Sites under way go ahead of queued new sites.
         if (gate.prio_waiting == 0 && has_room(gate) && !start_blocked(gate) && gate.next_ms <= now) {
@@ -359,11 +386,18 @@ Admit IpGates::acquire(uint32_t ip, GateWaiter* waiter, uint32_t max_waiters, ui
     return Admit::Queued;
 }
 
-uint32_t IpGates::restart(uint32_t ip, Outcome outcome, uint64_t now) {
+std::optional<uint32_t> IpGates::restart(uint32_t ip, Outcome outcome, GateWaiter* waiter, uint64_t now) {
     Shard& shard = shard_of(ip);
     ShardLock lock(shard.lock);
     Gate& gate = shard.get(ip, policy_);
     note(gate, outcome, now);
+    if (start_blocked(gate) && !gate.dead && !gate.throttled_out) {
+        // Another admitted start has not connected: reserving a time now
+        // could land closer than the spacing to it.
+        enqueue(gate, waiter, true);
+        waiter->holder = true;
+        return std::nullopt;  // started() or release() of that start dispatches it
+    }
     const uint64_t start = std::max(gate.next_ms, now);
     gate.next_ms = start + spacing(gate);
     ++gate.unstarted;  // the caller reports started() when it connects

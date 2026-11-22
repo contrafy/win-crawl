@@ -89,10 +89,11 @@ void print_politeness(const Config& cfg) {
     }
     std::printf("\n            ");
     if (p.fail_limit != 0) {
-        std::printf("IPs skipped after %u failed connections in a row", p.fail_limit);
+        std::printf("IPs skipped after %u failed connections (never answered) or 429/503s in a row", p.fail_limit);
     } else {
-        std::printf("IPs never skipped for failing");
+        std::printf("IPs never skipped");
     }
+    std::printf("; 429/503 penalty up to %u ms", p.max_penalty_ms);
     if (cfg.mode == Mode::Real) {
         std::printf("; Crawl-delay honoured up to %u s, Retry-After up to %u s", cfg.max_crawl_delay_s,
                     cfg.max_retry_after_s);

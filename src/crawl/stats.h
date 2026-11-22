@@ -51,9 +51,9 @@ enum class Counter : uint32_t {
     DnsRetries,
     DnsTimeouts,
     // Politeness (docs/politeness.md).
-    IpExtraHosts,      // hosts fetched beyond the first of their IP (--hosts-per-ip)
+    IpExtraHosts,      // hosts fetched beyond the first fetched host of their IP (--hosts-per-ip)
     IpBudgetSkips,     // hosts skipped by the per-IP host budget (the IP dedupe at --hosts-per-ip 1)
-    IpUnreachable,     // hosts skipped because their IP stopped answering (--ip-fail-limit)
+    IpUnreachable,     // hosts skipped because their IP never answered (--ip-fail-limit)
     IpBusy,            // redirects given up at an IP that is unreachable or has too many sites waiting
     CdnHosts,          // hosts fetched from IPs under the CDN limits
     PoliteWaits,       // waits for an IP: its queue or its connection spacing
@@ -63,6 +63,8 @@ enum class Counter : uint32_t {
     CrawlDelaySkips,   // pages skipped: Crawl-delay above --max-crawl-delay
     Throttled,         // 429 and 503 replies
     RetryAfterRetries, // requests repeated after waiting out a Retry-After
+    IpThrottled,       // hosts skipped because their IP kept answering 429/503 (--ip-fail-limit)
+    StoppedHosts,      // resolved hosts never attempted because the run was stopped
     Inflight,          // gauge: live URL tasks on the loop, politeness waits included
     PoliteWaiting,     // gauge: of those, sites waiting on politeness
     Count
