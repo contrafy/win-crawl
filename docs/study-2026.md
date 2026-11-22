@@ -71,7 +71,7 @@ not classify the 403s, but much of that is probably bot blocking.
 | TLS | Schannel on Windows 11 26200.9974, ClientHello offering X25519MLKEM768, x25519, P-256 key shares; certificate verification on, offline |
 | Wall time | 422.3 s |
 | Traffic | 1.50M DNS queries (A + HTTPS), 4.06 GB received, 33,593 redirects followed |
-| Output | 824,981 records (430 MB JSONL); analysis takes 3.5 s |
+| Output | 824,981 records (430 MB JSONL; 25 MB gzipped in the [`study-2026-11-21` release](https://github.com/contrafy/win-crawl/releases/tag/study-2026-11-21)); analysis takes 3.5 s |
 
 ## Caveats
 
