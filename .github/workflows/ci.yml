@@ -22,3 +22,50 @@ jobs:
         run: cmake --build --preset ${{ matrix.preset }}
       - name: Test
         run: ctest --preset ${{ matrix.preset }}
+
+  # clang-cl + ASan + libFuzzer: builds every target instrumented, runs the
+  # unit tests under ASan, then fuzzes each parser for a minute from its
+  # committed seed corpus.
+  fuzz:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Locate clang-cl with libFuzzer
+        shell: powershell
+        run: |
+          # Prefer the LLVM bundled with Visual Studio (it matches the MSVC STL),
+          # then a standalone LLVM install; the build needs libFuzzer's runtime.
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          $candidates = @("$vs\VC\Tools\Llvm\x64\bin", "$env:ProgramFiles\LLVM\bin")
+          $found = $null
+          foreach ($dir in $candidates) {
+            $cl = Join-Path $dir "clang-cl.exe"
+            if (-not (Test-Path $cl)) { Write-Host "no clang-cl in $dir"; continue }
+            $res = (& $cl /clang:-print-resource-dir).Trim()
+            $rt = Join-Path $res "lib\windows"
+            Write-Host "$cl -> $(& $cl --version | Select-Object -First 1); runtime dir $rt"
+            Get-ChildItem $rt -Filter "clang_rt.*" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $($_.Name)" }
+            if (Test-Path (Join-Path $rt "clang_rt.fuzzer_no_main-x86_64.lib")) { $found = $dir; break }
+          }
+          if (-not $found) { Write-Host "::error::no clang-cl with libFuzzer found"; exit 1 }
+          Write-Host "using $found"
+          Add-Content -Path $env:GITHUB_PATH -Value $found
+      - name: Configure
+        run: cmake --preset fuzz
+      - name: Build
+        run: cmake --build --preset fuzz
+      - name: Unit tests under ASan
+        run: ctest --preset fuzz
+      - name: Fuzz (60 s per target)
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File fuzz\run.ps1 -Seconds 60
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: build/fuzz/artifacts/
+          if-no-files-found: ignore
