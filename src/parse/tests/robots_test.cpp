@@ -2,6 +2,7 @@
 
 #include "doctest/doctest.h"
 
+#include <chrono>
 #include <string>
 
 using wc::parse::RobotsRules;
@@ -231,4 +232,40 @@ TEST_CASE("long targets and patterns") {
     const std::string path = "/" + std::string(4000, 'a') + ".gif";
     expect(star("Disallow: /*a*a*a*a*.gif$\n"), {{path.c_str(), false}});
     expect(star("Disallow: /*b\n"), {{path.c_str(), true}});
+}
+
+TEST_CASE("wildcard segments: leftmost matching, anchors, literal '$'") {
+    expect(star("Disallow: /*ab*ab$\n"), {{"/xabab", false}, {"/xab", true}, {"/aabab", false}, {"/abxab", false},
+                                         {"/abab", false}, {"/ab", true}});
+    expect(star("Disallow: /a*$\n"), {{"/a", false}, {"/abc", false}, {"/b", true}});
+    expect(star("Disallow: /a$b\n"), {{"/a$b", false}, {"/a", true}, {"/a$bc", false}});
+    expect(star("Disallow: /a$$\n"), {{"/a$", false}, {"/a$x", true}, {"/a", true}});
+    expect(star("Disallow: /**x**\n"), {{"/yx", false}, {"/y", true}});
+    expect(star("Disallow: *.php$\n"), {{"/index.php", false}, {"/index.php?x", true}, {"/a.php.bak", true}});
+    expect(star("Disallow: /*aab\n"), {{"/aaab", false}, {"/abaab", false}, {"/aba", true}});
+    expect(star("Disallow: /*xyz*xy$\n"), {{"/xyzxy", false}, {"/xyxy", true}, {"/xyzx", true}});
+}
+
+TEST_CASE("hostile robots.txt matches in linear time") {
+    // 260 rules of 1000 "*a" pairs (a 512 KiB file) against an 8 KB target:
+    // the old position-set matcher took O(rules * pattern * target) here,
+    // about 300 ms per allowed() call for a 2 KB target in release builds.
+    std::string rule = "Disallow: /";
+    for (int i = 0; i < 1000; ++i) {
+        rule += "*a";
+    }
+    rule += "b\n";
+    std::string body = "User-agent: *\n";
+    while (body.size() + rule.size() <= 512 * 1024) {
+        body += rule;
+    }
+    const RobotsRules rules = RobotsRules::parse(body, "wincrawl");
+    CHECK(rules.rule_count() == 260);
+    const std::string miss = "/" + std::string(8000, 'a');
+    const std::string hit = miss + "b";
+    const auto start = std::chrono::steady_clock::now();
+    CHECK(rules.allowed(miss));
+    CHECK_FALSE(rules.allowed(hit));
+    // Generous: linear matching takes a few ms even in debug builds.
+    CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds(2));
 }

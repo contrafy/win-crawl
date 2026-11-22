@@ -71,7 +71,7 @@ bool is_port_pressure(DWORD error) {
 
 // Server side: read the request, echo it back, then wait for the client to
 // go away (its abortive close arrives as an error or FIN) and self-destruct.
-class ServerConn : TcpHandler {
+class ServerConn final : TcpHandler {
 public:
     explicit ServerConn(Loop& loop) : socket_(loop, *this) {}
 
@@ -128,7 +128,7 @@ private:
     bool replied_ = false;
 };
 
-class ClientConn : TcpHandler {
+class ClientConn final : TcpHandler {
 public:
     ClientConn(Loop& loop, int id) : socket_(loop, *this) {
         std::memset(request_, 'a' + id % 26, sizeof(request_));

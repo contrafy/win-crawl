@@ -84,36 +84,68 @@ void normalize(std::string_view in, std::string& out) {
     }
 }
 
-// Does `pattern` ('*' = any run, trailing '$' = end anchor) match a prefix of
-// `path`? Tracks the set of reachable path positions, so no backtracking.
-bool matches(std::string_view path, std::string_view pattern, std::vector<size_t>& pos) {
-    const size_t n = path.size();
-    pos.assign(1, 0);
-    for (size_t i = 0; i < pattern.size(); ++i) {
-        const char c = pattern[i];
-        if (c == '$' && i + 1 == pattern.size()) {
-            return pos.back() == n;
+// End of the first occurrence of `needle` (non-empty) in `hay` at or after
+// `from`, or npos. Knuth-Morris-Pratt, so the cost is linear in the bytes
+// scanned plus the needle length whatever the input; `fail` is scratch.
+size_t find_end(std::string_view hay, size_t from, std::string_view needle, std::vector<size_t>& fail) {
+    fail.assign(needle.size(), 0);
+    for (size_t i = 1, k = 0; i < needle.size(); ++i) {
+        while (k > 0 && needle[i] != needle[k]) {
+            k = fail[k - 1];
         }
-        if (c == '*') {
-            const size_t first = pos.front();
-            pos.resize(n - first + 1);
-            for (size_t j = 0; j < pos.size(); ++j) {
-                pos[j] = first + j;
-            }
-            continue;
+        if (needle[i] == needle[k]) {
+            ++k;
         }
-        size_t kept = 0;
-        for (const size_t p : pos) {
-            if (p < n && path[p] == c) {
-                pos[kept++] = p + 1;
-            }
-        }
-        if (kept == 0) {
-            return false;
-        }
-        pos.resize(kept);
+        fail[i] = k;
     }
-    return true;
+    for (size_t i = from, k = 0; i < hay.size(); ++i) {
+        while (k > 0 && hay[i] != needle[k]) {
+            k = fail[k - 1];
+        }
+        if (hay[i] == needle[k] && ++k == needle.size()) {
+            return i + 1;
+        }
+    }
+    return std::string_view::npos;
+}
+
+// Does `pattern` ('*' = any run, trailing '$' = end anchor) match a prefix of
+// `path`? The pattern is literal segments separated by '*': the first must
+// start the path and the rest occur in order, and taking each at its
+// leftmost occurrence is optimal. With the anchor, the last segment must end
+// the path instead. Linear in pattern plus path, so a hostile robots.txt
+// (thousands of long "*a*a..." rules) cannot stall the crawler's loop thread.
+bool matches(std::string_view path, std::string_view pattern, std::vector<size_t>& scratch) {
+    const bool anchored = !pattern.empty() && pattern.back() == '$';
+    if (anchored) {
+        pattern.remove_suffix(1);
+    }
+    const size_t first_star = pattern.find('*');
+    const std::string_view head = pattern.substr(0, first_star);
+    if (path.substr(0, head.size()) != head) {
+        return false;
+    }
+    if (first_star == std::string_view::npos) {
+        return !anchored || path.size() == head.size();
+    }
+    const size_t last_star = pattern.rfind('*');
+    const std::string_view tail = pattern.substr(last_star + 1);
+    size_t cur = head.size();
+    for (size_t i = first_star + 1; i < last_star;) {
+        const size_t star = pattern.find('*', i);
+        const std::string_view segment = pattern.substr(i, star - i);
+        if (!segment.empty()) {
+            cur = find_end(path, cur, segment, scratch);
+            if (cur == std::string_view::npos) {
+                return false;
+            }
+        }
+        i = star + 1;
+    }
+    if (anchored) {
+        return path.size() >= cur + tail.size() && path.substr(path.size() - tail.size()) == tail;
+    }
+    return tail.empty() || find_end(path, cur, tail, scratch) != std::string_view::npos;
 }
 
 }  // namespace
@@ -224,14 +256,13 @@ bool RobotsRules::allowed(std::string_view target) const {
     }
     std::string norm;
     normalize(target, norm);
-    std::vector<size_t> pos;
-    pos.reserve(norm.size() + 1);
+    std::vector<size_t> scratch;
     size_t best_allow = 0;
     size_t best_disallow = 0;
     bool any_allow = false;
     bool any_disallow = false;
     for (const Rule& r : rules_) {
-        if (!matches(norm, r.pattern, pos)) {
+        if (!matches(norm, r.pattern, scratch)) {
             continue;
         }
         const size_t len = r.pattern.size();

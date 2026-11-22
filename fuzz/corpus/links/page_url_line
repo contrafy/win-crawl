@@ -1,0 +1,2 @@
+https://site.example:8443/deep/dir/index.php?q
+<base href="other/"><base href="ignored/"><a href="../up">u</a><a href=https://abs.example/p>p</a>
