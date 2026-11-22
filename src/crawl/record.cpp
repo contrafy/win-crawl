@@ -337,6 +337,12 @@ void SiteRecord::clear() {
     tls.pq.reset();
     tls.resumed.reset();
     ms = 0;
+    skip = nullptr;
+    wait_ms = 0;
+    crawl_delay.reset();
+    crawl_delay_ms = 0;
+    retry_after.reset();
+    retried.reset();
 }
 
 void SiteRecord::set_page_reply(const parse::ResponseParser& reply, const parse::Url& reply_url,
@@ -492,6 +498,21 @@ void SiteRecord::append_json(std::string& out) const {
     opt_uint(out, "links", links);
     key(out, "ms");
     append_uint(out, ms);
+    opt_name(out, "skip", skip);
+    key(out, "wait_ms");
+    append_uint(out, wait_ms);
+    key(out, "crawl_delay");
+    if (crawl_delay) {
+        char buf[32];
+        const auto r = std::to_chars(buf, buf + sizeof(buf), *crawl_delay);  // shortest round-trip form
+        out.append(buf, r.ptr);
+    } else {
+        out.append("null");
+    }
+    key(out, "crawl_delay_ms");
+    append_uint(out, crawl_delay_ms);
+    opt_uint(out, "retry_after", retry_after);
+    opt_bool(out, "retried", retried);
     out.append("}\n");
 }
 

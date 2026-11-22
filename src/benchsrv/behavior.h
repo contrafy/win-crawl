@@ -45,6 +45,14 @@ struct Behavior {
     double server_error = 0.02;
     double chunked = 0.1;       // fraction of 200 pages sent with chunked encoding
     Delay http_delay;
+
+    // Politeness (docs/politeness.md): worlds with many hosts per IP,
+    // Crawl-delays and rate limiting.
+    uint32_t ip_pool = 0;        // > 0: host N resolves to host_unique_ip(N % ip_pool) (overrides ip_share)
+    double crawl_delay = 0;      // fraction of hosts whose robots.txt (when present) has a Crawl-delay
+    uint32_t crawl_delay_s = 1;  // its value, seconds
+    double throttle = 0;         // fraction of hosts whose first page request gets 429
+    uint32_t retry_after_s = 1;  // the Retry-After of that 429
 };
 
 // Number of pre-generated page templates; template sizes average page_kb.
@@ -77,6 +85,10 @@ uint32_t dns_delay_ms(const Behavior& b, uint64_t key);
 
 // --- HTTP decisions ------------------------------------------------------
 bool robots_missing(const Behavior& b, uint64_t n);
+// The host's robots.txt (when present) asks for Crawl-delay: crawl_delay_s.
+bool host_crawl_delay(const Behavior& b, uint64_t n);
+// The host answers its first page request 429 with Retry-After: retry_after_s.
+bool host_throttled(const Behavior& b, uint64_t n);
 
 enum class PageKind : uint8_t { Ok, Redirect, NotFound, ServerError };
 

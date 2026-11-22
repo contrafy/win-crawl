@@ -1,5 +1,7 @@
 #include "crawl/config.h"
 
+#include "crawl/ipranges.h"
+
 #include <windows.h>
 
 #include <charconv>
@@ -33,6 +35,17 @@ enum class Opt {
     Record,
     HttpsRr,
     Quiet,
+    HostsPerIp,
+    NoIpDedupe,
+    IpConcurrency,
+    IpInterval,
+    MaxCrawlDelay,
+    MaxRetryAfter,
+    IpFailLimit,
+    NoCdnPolicy,
+    CdnHostsPerIp,
+    CdnIpConcurrency,
+    CdnIpInterval,
     Help,
 };
 
@@ -64,6 +77,17 @@ constexpr OptSpec kOptions[] = {
     {Opt::Record, "record", 0, true},
     {Opt::HttpsRr, "https-rr", 0, false},
     {Opt::Quiet, "quiet", 'q', false},
+    {Opt::HostsPerIp, "hosts-per-ip", 0, true},
+    {Opt::NoIpDedupe, "no-ip-dedupe", 0, false},
+    {Opt::IpConcurrency, "ip-concurrency", 0, true},
+    {Opt::IpInterval, "ip-interval", 0, true},
+    {Opt::MaxCrawlDelay, "max-crawl-delay", 0, true},
+    {Opt::MaxRetryAfter, "max-retry-after", 0, true},
+    {Opt::IpFailLimit, "ip-fail-limit", 0, true},
+    {Opt::NoCdnPolicy, "no-cdn-policy", 0, false},
+    {Opt::CdnHostsPerIp, "cdn-hosts-per-ip", 0, true},
+    {Opt::CdnIpConcurrency, "cdn-ip-concurrency", 0, true},
+    {Opt::CdnIpInterval, "cdn-ip-interval", 0, true},
     {Opt::Help, "help", 'h', false},
 };
 
@@ -277,6 +301,48 @@ ParseResult apply(const OptSpec& spec, std::string_view value, Config& cfg, Give
     case Opt::Quiet:
         cfg.quiet = true;
         break;
+    case Opt::HostsPerIp:
+        if (!parse_range(value, 0, 10000000, v)) return bad("an integer in 0..10000000 (0 = unlimited)");
+        cfg.hosts_per_ip = static_cast<unsigned>(v);
+        break;
+    case Opt::NoIpDedupe:
+        cfg.hosts_per_ip = 0;
+        break;
+    case Opt::IpConcurrency:
+        if (!parse_range(value, 0, 100000, v)) return bad("an integer in 0..100000 (0 = unlimited)");
+        cfg.ip_concurrency = static_cast<unsigned>(v);
+        break;
+    case Opt::IpInterval:
+        if (!parse_range(value, 0, 600000, v)) return bad("milliseconds in 0..600000");
+        cfg.ip_interval_ms = static_cast<unsigned>(v);
+        break;
+    case Opt::MaxCrawlDelay:
+        if (!parse_range(value, 0, 3600, v)) return bad("seconds in 0..3600");
+        cfg.max_crawl_delay_s = static_cast<unsigned>(v);
+        break;
+    case Opt::MaxRetryAfter:
+        if (!parse_range(value, 0, 3600, v)) return bad("seconds in 0..3600");
+        cfg.max_retry_after_s = static_cast<unsigned>(v);
+        break;
+    case Opt::IpFailLimit:
+        if (!parse_range(value, 0, 1000, v)) return bad("an integer in 0..1000 (0 = never)");
+        cfg.ip_fail_limit = static_cast<unsigned>(v);
+        break;
+    case Opt::NoCdnPolicy:
+        cfg.cdn_policy = false;
+        break;
+    case Opt::CdnHostsPerIp:
+        if (!parse_range(value, 0, 10000000, v)) return bad("an integer in 0..10000000 (0 = unlimited)");
+        cfg.cdn_hosts_per_ip = static_cast<unsigned>(v);
+        break;
+    case Opt::CdnIpConcurrency:
+        if (!parse_range(value, 0, 100000, v)) return bad("an integer in 0..100000 (0 = unlimited)");
+        cfg.cdn_ip_concurrency = static_cast<unsigned>(v);
+        break;
+    case Opt::CdnIpInterval:
+        if (!parse_range(value, 0, 600000, v)) return bad("milliseconds in 0..600000");
+        cfg.cdn_ip_interval_ms = static_cast<unsigned>(v);
+        break;
     case Opt::Help:
         return ParseResult{ParseStatus::Help, {}, {}};
     }
@@ -287,6 +353,26 @@ ParseResult apply(const OptSpec& spec, std::string_view value, Config& cfg, Give
 
 const char* mode_name(Mode mode) {
     return mode == Mode::Real ? "real" : "classic";
+}
+
+GatePolicy gate_policy(const Config& cfg) {
+    GatePolicy p;
+    p.ip.hosts = cfg.hosts_per_ip;
+    p.ip.concurrency = cfg.ip_concurrency;
+    p.ip.interval_ms = cfg.ip_interval_ms;
+    p.ip.backoff = true;
+    // With the assignment's IP dedupe (the default) CDN IPs are deduped too,
+    // so a default run keeps its published semantics; a measurement run that
+    // lifts the budget lifts it for CDN edges entirely.
+    p.cdn.hosts = cfg.cdn_hosts_per_ip.value_or(cfg.hosts_per_ip == 1 ? 1u : 0u);
+    p.cdn.concurrency = cfg.cdn_ip_concurrency;
+    p.cdn.interval_ms = cfg.cdn_ip_interval_ms;
+    p.cdn.backoff = false;  // one origin's 429 says nothing about the edge's other origins
+    if (cfg.cdn_policy) {
+        p.cdn_ranges = cfg.cdn_ranges != nullptr ? cfg.cdn_ranges : &cloudflare_ipv4();
+    }
+    p.fail_limit = cfg.ip_fail_limit;
+    return p;
 }
 
 unsigned logical_cpu_count() {
@@ -402,7 +488,9 @@ Modes:
 
 Engine:
   -t, --threads N         event loops (default: logical CPUs; capped at -c)
-  -c, --concurrency N     max in-flight URL tasks across all loops (default 4000)
+  -c, --concurrency N     max in-flight URL tasks across all loops (default 4000);
+                          sites waiting on politeness hold no socket and do
+                          not count
 
 DNS:
   --dns ADDR[:PORT][,...] DNS servers (default 1.1.1.1,1.0.0.1); use --dns system
@@ -423,6 +511,27 @@ HTTP:
   --no-pq                 real mode: do not offer the hybrid post-quantum key
                           exchange (X25519MLKEM768); it is offered by default
   --max-redirects N       real mode: redirects followed per page (default 5)
+
+Politeness (per target; see docs/politeness.md):
+  --hosts-per-ip N        hosts fetched per IP (default 1: the assignment's IP
+                          dedupe); 0 = unlimited. Hosts past it are skipped
+  --no-ip-dedupe          same as --hosts-per-ip 0
+  --ip-concurrency N      connections open at once to one IP (default 2; 0 = no cap)
+  --ip-interval MS        minimum time between connection starts to one IP
+                          (default 250); 429/503 replies lengthen it
+  --max-crawl-delay S     real mode: honour robots.txt Crawl-delay up to S
+                          seconds between requests to a host; a longer delay
+                          skips the page (default 30)
+  --max-retry-after S     real mode: wait out a 429/503 Retry-After of up to S
+                          seconds and retry once (default 30)
+  --ip-fail-limit N       after N failed connections in a row (refused,
+                          unreachable, timed out) skip the IP's other hosts
+                          (default 5; 0 = never)
+  --cdn-hosts-per-ip N    hosts per IP inside Cloudflare's ranges (default:
+                          1 with --hosts-per-ip 1, else unlimited)
+  --cdn-ip-concurrency N  connections per Cloudflare IP (default 16)
+  --cdn-ip-interval MS    spacing per Cloudflare IP (default 0)
+  --no-cdn-policy         treat Cloudflare IPs like any other IP
 
 Output:
   --stats-interval MS     periodic status interval (default 2000)

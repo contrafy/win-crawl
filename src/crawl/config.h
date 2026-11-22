@@ -2,7 +2,10 @@
 // Crawler configuration and its command line. Parsing is pure (no I/O, no
 // process exit) so it is unit-testable; main() decides what to print.
 
+#include "crawl/politeness.h"
+
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -11,6 +14,8 @@ namespace wc::crawl {
 enum class Mode { Classic, Real };
 
 const char* mode_name(Mode mode);  // "classic" | "real"
+
+class Ipv4Ranges;
 
 struct DnsServer {
     uint32_t ipv4_be = 0;  // network byte order
@@ -46,7 +51,25 @@ struct Config {
     bool https_rr = false;    // --https-rr: also query each resolved host's HTTPS RR (needs --record)
     bool post_quantum = true; // real only: offer the hybrid post-quantum TLS group (--no-pq disables)
     bool quiet = false;
+
+    // Politeness (docs/politeness.md). Hosts and concurrency: 0 = unlimited.
+    unsigned hosts_per_ip = 1;        // 1 = the assignment's IP dedupe
+    unsigned ip_concurrency = 2;      // connections open at once to one IP
+    unsigned ip_interval_ms = 250;    // minimum spacing between connection starts to one IP
+    unsigned max_crawl_delay_s = 30;  // real mode: a longer robots.txt Crawl-delay skips the page
+    unsigned max_retry_after_s = 30;  // real mode: a 429/503 Retry-After up to this is waited out once
+    unsigned ip_fail_limit = 5;       // consecutive failed connections before an IP counts as unreachable; 0 = never
+    // CDN edges (IPs in cdn_ranges) front many unrelated origins, so per-IP
+    // limits protect nothing there; they get their own.
+    bool cdn_policy = true;
+    std::optional<unsigned> cdn_hosts_per_ip;  // unset: 1 with hosts_per_ip 1, else unlimited
+    unsigned cdn_ip_concurrency = 16;
+    unsigned cdn_ip_interval_ms = 0;
+    const Ipv4Ranges* cdn_ranges = nullptr;  // null: Cloudflare's compiled-in ranges (tests inject their own)
 };
+
+// The gate limits `cfg` asks for, defaults resolved.
+GatePolicy gate_policy(const Config& cfg);
 
 // Robots body caps when --robots-limit is not given.
 constexpr uint64_t kClassicRobotsLimit = 16384;

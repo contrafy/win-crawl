@@ -1,7 +1,8 @@
 #pragma once
-// Global, thread-safe "seen before?" sets shared by all event loops.
+// Global, thread-safe "seen before?" set of hosts shared by all event loops.
+// (The per-IP budget that used to be a second set lives in politeness.h.)
 //
-// Both sets are 256 independently locked shards (SRWLOCK) of open-addressing
+// The set is 256 independently locked shards (SRWLOCK) of open-addressing
 // tables of 64-bit keys, so concurrent inserts from different loops almost
 // never contend: with 16 loops the chance that two simultaneous inserts hit the
 // same shard is ~6%, and each critical section is a handful of probes.
@@ -48,18 +49,6 @@ public:
     explicit HostSet(size_t expected = 0) : set_(expected) {}
     // Thread-safe. True when `host` (case-insensitive) was not seen before.
     bool insert(std::string_view host);
-    size_t size() const { return set_.size(); }
-
-private:
-    ShardedSet64 set_;
-};
-
-class IpSet {
-public:
-    explicit IpSet(size_t expected = 0) : set_(expected) {}
-    // Thread-safe. `ipv4_be` in network byte order. True when new. Exact: the
-    // address goes through a bijective mixer, so distinct IPs never collide.
-    bool insert(uint32_t ipv4_be);
     size_t size() const { return set_.size(); }
 
 private:

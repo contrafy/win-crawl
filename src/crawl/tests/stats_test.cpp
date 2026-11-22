@@ -37,6 +37,8 @@ TEST_CASE("stats: status and rate lines use the course format") {
     CHECK(format_status(s, 4.9, 987655) ==
           "[  4]    512 Q  987655 E   12345 H  10000 D   7000 I  6000 R  3000 C  2500 L  123K");
     CHECK(format_rate(123.45, 9.87) == "      *** crawling 123.5 pps @ 9.9 Mbps");
+    CHECK(format_rate(123.45, 9.87, 0) == "      *** crawling 123.5 pps @ 9.9 Mbps");
+    CHECK(format_rate(1, 2, 3456) == "      *** crawling 1.0 pps @ 2.0 Mbps, 3456 waiting on politeness");
 }
 
 TEST_CASE("stats: summary keeps the original wording") {
@@ -66,6 +68,24 @@ TEST_CASE("stats: summary keeps the original wording") {
     CHECK(text.find("Peak in-flight 321") != std::string::npos);
     CHECK(text.find("Post-quantum") == std::string::npos);  // classic: no TLS
 
+    s[Counter::IpExtraHosts] = 7;
+    s[Counter::IpBudgetSkips] = 8;
+    s[Counter::IpUnreachable] = 9;
+    s[Counter::IpBusy] = 1;
+    s[Counter::PoliteWaits] = 11;
+    s[Counter::PoliteWaitMs] = 12500;
+    s[Counter::CrawlDelayWaits] = 2;
+    s[Counter::CrawlDelayMs] = 3000;
+    s[Counter::CrawlDelaySkips] = 4;
+    s[Counter::Throttled] = 5;
+    s[Counter::RetryAfterRetries] = 3;
+    const std::string polite = format_summary(s, info);
+    CHECK(polite.find("Politeness: 7 hosts beyond the first per IP, 8 skipped by the per-IP budget, 9 on "
+                      "unreachable IPs, 1 redirects refused (busy or unreachable IP); 11 waits (12.5 s)\n") !=
+          std::string::npos);
+    CHECK(polite.find("Crawl-delay: 2 waits (3.0 s), 4 pages skipped; 429/503 replies 5, Retry-After retries 3\n") !=
+          std::string::npos);
+
     info.pq_requested = false;
     info.pq_offered = false;
     CHECK(format_summary(s, info).find("Post-quantum key exchange: disabled (--no-pq), not offered in the "
@@ -76,25 +96,32 @@ TEST_CASE("stats: json carries every schema key in order") {
     Snapshot s;
     s[Counter::UrlsRead] = 42;
     s[Counter::DnsTimeouts] = 3;
-    s[Counter::Inflight] = 9;  // gauge, not part of the schema
+    s[Counter::Inflight] = 9;  // gauges, not part of the schema
+    s[Counter::PoliteWaiting] = 4;
+    s[Counter::IpExtraHosts] = 6;
+    s[Counter::RetryAfterRetries] = 2;
     RunInfo info{"real", 2, 100, 1.5, 77, true, true};
     const std::string json = format_json(s, info);
     CHECK(json.front() == '{');
     CHECK(json.substr(json.size() - 2) == "}\n");
     CHECK(json.find("\"mode\":\"real\",\"threads\":2,\"concurrency\":100,\"elapsed_s\":1.500,\"urls_read\":42,") == 1);
-    CHECK(json.find("\"dns_timeouts\":3,\"peak_inflight\":77,\"pq_requested\":true,\"pq_offered\":true}") !=
+    CHECK(json.find("\"dns_timeouts\":3,\"ip_extra_hosts\":6,") != std::string::npos);
+    CHECK(json.find("\"retry_after_retries\":2,\"peak_inflight\":77,\"pq_requested\":true,\"pq_offered\":true}") !=
           std::string::npos);
     info.pq_requested.reset();
     info.pq_offered.reset();
     CHECK(format_json(s, info).find("\"pq_requested\":null,\"pq_offered\":null}") != std::string::npos);
     CHECK(json.find("inflight\":9") == std::string::npos);
+    CHECK(json.find("waiting\"") == std::string::npos);
     size_t prev = 0;
     for (const char* key :
          {"mode", "threads", "concurrency", "elapsed_s", "urls_read", "urls_parsed", "unique_hosts", "dns_ok",
           "dns_fail", "unique_ips", "robots_attempted", "robots_passed", "pages_attempted", "pages_ok", "http_2xx",
           "http_3xx", "http_4xx", "http_5xx", "http_other", "links", "bytes_received", "connect_fail", "timeouts",
           "tls_fail", "tls_cert_fail", "port_exhaustion", "other_fail", "redirects_followed", "dns_queries_sent",
-          "dns_retries", "dns_timeouts", "peak_inflight", "pq_requested", "pq_offered"}) {
+          "dns_retries", "dns_timeouts", "ip_extra_hosts", "ip_budget_skips", "ip_unreachable", "ip_busy",
+          "cdn_hosts", "polite_waits", "polite_wait_ms", "crawl_delay_waits", "crawl_delay_ms", "crawl_delay_skips",
+          "throttled", "retry_after_retries", "peak_inflight", "pq_requested", "pq_offered"}) {
         const size_t at = json.find("\"" + std::string(key) + "\":");
         CHECK_MESSAGE(at != std::string::npos, key);
         CHECK_MESSAGE(at >= prev, key);

@@ -64,7 +64,7 @@ the same keys in the same order.
 | `host` | string | the seed host, lowercased |
 | `dns` | string | A lookup of the seed host: `ok`, `nxdomain`, `noanswer` (NOERROR without an A record, or truncated), `servfail` (SERVFAIL/REFUSED/other rcode on every attempt), `timeout` (no reply after every attempt), `invalid` (not a DNS name), `cancelled` (run stopped); null only if the run stopped before the lookup started |
 | `ip` | string | first A record, dotted quad; null unless `dns` is `ok` |
-| `ip_dup` | bool | the IP was already claimed by an earlier host; such sites are not fetched (the assignment's IP dedupe) |
+| `ip_dup` | bool | the host was over its IP's host budget (`--hosts-per-ip`, default 1: the IP was already claimed by an earlier host, the assignment's IP dedupe); such sites are not fetched |
 | `cf_ip` | bool | the IP lies in Cloudflare's published IPv4 ranges (`data/cloudflare-ips-v4.txt`, compiled in) |
 | `https_rr` | object | null unless `--https-rr` and `dns` is `ok`; see below |
 | `robots_status` | int | status of the seed origin's robots.txt reply, after robots redirects (the last reply in that chain) |
@@ -86,6 +86,12 @@ the same keys in the same order.
 | `bytes` | int | decoded body bytes of the last page reply |
 | `links` | int | links extracted from it (2xx `text/html` / `application/xhtml+xml` only in real mode, any 2xx in classic) |
 | `ms` | int | milliseconds from the task start (input line claimed) to the record, DNS queueing included |
+| `skip` | string | why politeness skipped the host or its page: `ip_budget`, `ip_unreachable`, `crawl_delay`; null otherwise ([`politeness.md`](politeness.md)) |
+| `wait_ms` | int | time the site waited on politeness (IP queue and spacing, Crawl-delay, Retry-After) |
+| `crawl_delay` | number | Crawl-delay (seconds) in the seed origin's robots.txt |
+| `crawl_delay_ms` | int | the part of `wait_ms` spent on Crawl-delay |
+| `retry_after` | int | Retry-After (seconds) of the first 429/503 that carried one |
+| `retried` | bool | that Retry-After was waited out and the request repeated once |
 
 Fetch errors: `connect_fail` (refused, unreachable, or `--connect-timeout`),
 `timeout` (the whole fetch exceeded `--timeout`), `tls_fail`,

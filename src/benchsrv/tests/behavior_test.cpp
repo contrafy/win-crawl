@@ -125,6 +125,27 @@ TEST_CASE("decision fractions match the configuration and are deterministic") {
     CHECK(differ > 50);
 }
 
+TEST_CASE("politeness knobs: IP pool, Crawl-delay and throttle fractions") {
+    Behavior b;
+    b.ip_pool = 5;
+    for (uint64_t n = 0; n < 100; ++n) {
+        CHECK(host_ip(b, n) == host_unique_ip(n % 5));
+    }
+    b.crawl_delay = 0.3;
+    b.throttle = 0.2;
+    constexpr uint64_t kHosts = 100000;
+    size_t delayed = 0, throttled = 0;
+    for (uint64_t n = 0; n < kHosts; ++n) {
+        delayed += host_crawl_delay(b, n) ? 1 : 0;
+        throttled += host_throttled(b, n) ? 1 : 0;
+    }
+    CHECK(static_cast<double>(delayed) / kHosts == doctest::Approx(0.3).epsilon(0.05));
+    CHECK(static_cast<double>(throttled) / kHosts == doctest::Approx(0.2).epsilon(0.05));
+    Behavior off;  // defaults: neither
+    CHECK_FALSE(host_crawl_delay(off, 1));
+    CHECK_FALSE(host_throttled(off, 1));
+}
+
 TEST_CASE("page plans: status mix and redirect targets") {
     Behavior b;
     size_t counts[4] = {};
