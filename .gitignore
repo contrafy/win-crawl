@@ -13,3 +13,6 @@ CMakeUserPresets.json
 # Local benchmark output
 /bench/results/local/
 *.log
+
+# Python bytecode (tools/)
+__pycache__/
