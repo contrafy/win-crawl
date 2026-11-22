@@ -503,7 +503,7 @@ def render(s: Stats, seeds: int | None = None, title: str = "wincrawl measuremen
         [
             ["IP in Cloudflare's published ranges, of resolved hosts", share(s.cf_ip, s.cf_ip_known)],
             ["CF-RAY header on the first reply, of hosts with a reply", share(s.cf_ray, s.cf_ray_known)],
-            ["either signal (\"behind Cloudflare\"), of unique hosts", share(s.cf_any, s.records)],
+            ["either signal (\"behind Cloudflare\"), of resolved hosts", share(s.cf_any, s.dns_ok)],
             ["signals agree, of hosts with both known", share(a[(True, True)] + a[(False, False)], s.cf_both_known)],
         ],
     )
