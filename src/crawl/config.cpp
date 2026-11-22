@@ -1,6 +1,7 @@
 #include "crawl/config.h"
 
 #include "crawl/ipranges.h"
+#include "sig/signer.h"
 
 #include <windows.h>
 
@@ -46,6 +47,8 @@ enum class Opt {
     CdnHostsPerIp,
     CdnIpConcurrency,
     CdnIpInterval,
+    BotAuthKey,
+    SignatureAgent,
     Help,
 };
 
@@ -88,6 +91,8 @@ constexpr OptSpec kOptions[] = {
     {Opt::CdnHostsPerIp, "cdn-hosts-per-ip", 0, true},
     {Opt::CdnIpConcurrency, "cdn-ip-concurrency", 0, true},
     {Opt::CdnIpInterval, "cdn-ip-interval", 0, true},
+    {Opt::BotAuthKey, "bot-auth-key", 0, true},
+    {Opt::SignatureAgent, "signature-agent", 0, true},
     {Opt::Help, "help", 'h', false},
 };
 
@@ -343,6 +348,13 @@ ParseResult apply(const OptSpec& spec, std::string_view value, Config& cfg, Give
         if (!parse_range(value, 0, 600000, v)) return bad("milliseconds in 0..600000");
         cfg.cdn_ip_interval_ms = static_cast<unsigned>(v);
         break;
+    case Opt::BotAuthKey:
+        cfg.bot_auth_key_path = std::string(value);
+        break;
+    case Opt::SignatureAgent:
+        if (!sig::valid_signature_agent(value)) return bad("an https:// URL in printable ASCII");
+        cfg.signature_agent = std::string(value);
+        break;
     case Opt::Help:
         return ParseResult{ParseStatus::Help, {}, {}};
     }
@@ -451,6 +463,9 @@ ParseResult parse_args(int argc, const char* const* argv, Config& out) {
     if (cfg.https_rr && cfg.record_path.empty()) {
         return error("--https-rr needs --record FILE (the answers are only recorded there)");
     }
+    if (cfg.bot_auth_key_path.empty() != cfg.signature_agent.empty()) {
+        return error("--bot-auth-key and --signature-agent go together (the key signs; the URL says where to find it)");
+    }
 
     if (cfg.threads == 0) {
         cfg.threads = logical_cpu_count();
@@ -532,6 +547,13 @@ Politeness (per target; see docs/politeness.md):
   --cdn-ip-concurrency N  connections per Cloudflare IP (default 16)
   --cdn-ip-interval MS    spacing per Cloudflare IP (default 0)
   --no-cdn-policy         treat Cloudflare IPs like any other IP
+
+Web Bot Auth (signed requests; see docs/web-bot-auth.md):
+  --bot-auth-key FILE     sign every request (RFC 9421, Ed25519) with this
+                          private key: a JWK from wincrawl-botauth keygen, or
+                          PKCS#8 PEM; needs --signature-agent
+  --signature-agent URL   https URL of the key directory, sent (and signed) as
+                          Signature-Agent; each signature is valid for 60 s
 
 Output:
   --stats-interval MS     periodic status interval (default 2000)

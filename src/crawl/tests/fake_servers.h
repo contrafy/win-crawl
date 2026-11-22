@@ -7,6 +7,7 @@
 #include "net/loop.h"
 #include "net/tcp.h"
 #include "net/udp.h"
+#include "sig/httpsig.h"
 
 #include <atomic>
 #include <cstdint>
@@ -98,12 +99,20 @@ public:
     uint64_t requests(const std::string& host, const std::string& path) const;
     uint64_t total_requests() const { return total_requests_.load(); }
 
+    // Web Bot Auth: from now on every request's signature is checked against
+    // `keys` with sig::verify_signatures (Web Bot Auth profile, wall clock).
+    void verify_signatures(std::vector<sig::PublicJwk> keys) { keys_ = std::move(keys); }
+    uint64_t signatures_valid() const { return sig_valid_.load(); }
+    uint64_t signatures_invalid() const { return sig_invalid_.load(); }  // unsigned ones included
+    std::string first_signature_error() const;
+
     class Conn;
 
 private:
     friend class Conn;
     struct Listener;
     const Route* find(const std::string& host, const std::string& path) const;
+    void check_signature(const std::string& head);
     void count(const std::string& host, const std::string& path);
 
     ServerThread& thread_;
@@ -113,6 +122,10 @@ private:
     mutable std::mutex mutex_;
     std::map<std::string, uint64_t> hits_;
     std::atomic<uint64_t> total_requests_{0};
+    std::vector<sig::PublicJwk> keys_;  // set before the client starts
+    std::atomic<uint64_t> sig_valid_{0};
+    std::atomic<uint64_t> sig_invalid_{0};
+    std::string sig_error_;  // guarded by mutex_
 };
 
 }  // namespace wc::crawl::test

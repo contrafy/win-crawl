@@ -3,6 +3,7 @@
 // process exit) so it is unit-testable; main() decides what to print.
 
 #include "crawl/politeness.h"
+#include "sig/crypto.h"
 
 #include <cstdint>
 #include <optional>
@@ -66,6 +67,12 @@ struct Config {
     unsigned cdn_ip_concurrency = 16;
     unsigned cdn_ip_interval_ms = 0;
     const Ipv4Ranges* cdn_ranges = nullptr;  // null: Cloudflare's compiled-in ranges (tests inject their own)
+
+    // Web Bot Auth (docs/web-bot-auth.md): with a key, every request carries
+    // Signature-Agent, Signature-Input and Signature.
+    std::string bot_auth_key_path;  // --bot-auth-key FILE; main() loads it into bot_auth_key
+    std::string signature_agent;    // --signature-agent URL: the key directory, https
+    sig::Ed25519Key bot_auth_key;   // valid() = sign requests
 };
 
 // The gate limits `cfg` asks for, defaults resolved.

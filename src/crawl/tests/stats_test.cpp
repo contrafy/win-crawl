@@ -106,11 +106,13 @@ TEST_CASE("stats: json carries every schema key in order") {
     CHECK(json.substr(json.size() - 2) == "}\n");
     CHECK(json.find("\"mode\":\"real\",\"threads\":2,\"concurrency\":100,\"elapsed_s\":1.500,\"urls_read\":42,") == 1);
     CHECK(json.find("\"dns_timeouts\":3,\"ip_extra_hosts\":6,") != std::string::npos);
-    CHECK(json.find("\"retry_after_retries\":2,\"peak_inflight\":77,\"pq_requested\":true,\"pq_offered\":true}") !=
-          std::string::npos);
+    CHECK(json.find("\"retry_after_retries\":2,\"peak_inflight\":77,\"pq_requested\":true,\"pq_offered\":true,"
+                    "\"bot_auth\":false}") != std::string::npos);
     info.pq_requested.reset();
     info.pq_offered.reset();
-    CHECK(format_json(s, info).find("\"pq_requested\":null,\"pq_offered\":null}") != std::string::npos);
+    info.bot_auth = true;
+    CHECK(format_json(s, info).find("\"pq_requested\":null,\"pq_offered\":null,\"bot_auth\":true}") !=
+          std::string::npos);
     CHECK(json.find("inflight\":9") == std::string::npos);
     CHECK(json.find("waiting\"") == std::string::npos);
     size_t prev = 0;
@@ -121,7 +123,7 @@ TEST_CASE("stats: json carries every schema key in order") {
           "tls_fail", "tls_cert_fail", "port_exhaustion", "other_fail", "redirects_followed", "dns_queries_sent",
           "dns_retries", "dns_timeouts", "ip_extra_hosts", "ip_budget_skips", "ip_unreachable", "ip_busy",
           "cdn_hosts", "polite_waits", "polite_wait_ms", "crawl_delay_waits", "crawl_delay_ms", "crawl_delay_skips",
-          "throttled", "retry_after_retries", "peak_inflight", "pq_requested", "pq_offered"}) {
+          "throttled", "retry_after_retries", "peak_inflight", "pq_requested", "pq_offered", "bot_auth"}) {
         const size_t at = json.find("\"" + std::string(key) + "\":");
         CHECK_MESSAGE(at != std::string::npos, key);
         CHECK_MESSAGE(at >= prev, key);

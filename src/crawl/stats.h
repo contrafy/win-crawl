@@ -125,6 +125,7 @@ struct RunInfo {
     // post-quantum group (Schannel enables them machine-wide).
     std::optional<bool> pq_requested;
     std::optional<bool> pq_offered;
+    bool bot_auth = false;  // requests were signed (Web Bot Auth, --bot-auth-key)
 };
 
 // "[%3d] %6d Q %7d E %7d H %6d D %6d I %5d R %5d C %5d L %4dK" (no newline).

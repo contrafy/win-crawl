@@ -21,6 +21,10 @@ void append_int(std::string& out, int64_t v) {
 
 }  // namespace
 
+bool valid_signature_agent(std::string_view url) {
+    return url.starts_with("https://") && url.size() > 8 && sfv::valid_string(url);
+}
+
 bool RequestSigner::init(const Ed25519Key& key, const SignerOptions& options, std::string* error) {
     key_ = Ed25519Key();
     auto bad = [&](const char* why) {
@@ -36,7 +40,7 @@ bool RequestSigner::init(const Ed25519Key& key, const SignerOptions& options, st
         return bad("validity must be 1 to 86400 seconds");
     }
     const std::string& url = options.signature_agent;
-    if (!url.empty() && (!url.starts_with("https://") || url.size() == 8 || !sfv::valid_string(url))) {
+    if (!url.empty() && !valid_signature_agent(url)) {
         return bad("Signature-Agent must be an https:// URL in printable ASCII");
     }
     keyid_ = thumbprint(key.public_key());

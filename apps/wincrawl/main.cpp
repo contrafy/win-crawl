@@ -6,6 +6,7 @@
 #include "crawl/input.h"
 #include "crawl/stats.h"
 #include "net/addr.h"
+#include "sig/jwk.h"
 #include "tls/tls.h"
 
 #include <windows.h>
@@ -49,6 +50,28 @@ bool write_file(const std::string& path, const std::string& text) {
     }
     const bool ok = std::fwrite(text.data(), 1, text.size(), f) == text.size();
     return std::fclose(f) == 0 && ok;
+}
+
+// --bot-auth-key: a private JWK or PKCS#8 PEM. The file text is wiped after use.
+bool load_bot_auth_key(Config& cfg, std::string& error) {
+    FILE* f = std::fopen(cfg.bot_auth_key_path.c_str(), "rb");
+    if (f == nullptr) {
+        error = "cannot read " + cfg.bot_auth_key_path;
+        return false;
+    }
+    std::string text;
+    char buf[4096];
+    size_t n = 0;
+    while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) text.append(buf, n);
+    std::fclose(f);
+    const wc::sig::JwkError e = wc::sig::parse_private_key(text, cfg.bot_auth_key);
+    wc::sig::secure_zero(text.data(), text.size());
+    wc::sig::secure_zero(buf, sizeof buf);
+    if (e != wc::sig::JwkError::None) {
+        error = cfg.bot_auth_key_path + ": " + wc::sig::to_string(e);
+        return false;
+    }
+    return true;
 }
 
 std::string limit(uint32_t v, const char* unit) {
@@ -109,6 +132,14 @@ int main(int argc, char** argv) {
     std::printf("DNS %s, %u in flight, %u ms x %u attempts\n", dns.c_str(), cfg.dns_inflight, cfg.dns_timeout_ms,
                 cfg.dns_attempts);
     print_politeness(cfg);
+    if (!cfg.bot_auth_key_path.empty()) {
+        if (!load_bot_auth_key(cfg, error)) {
+            std::fprintf(stderr, "wincrawl: %s\n", error.c_str());
+            return 1;
+        }
+        std::printf("Web Bot Auth: signing every request, keyid %s, Signature-Agent \"%s\"\n",
+                    wc::sig::thumbprint(cfg.bot_auth_key.public_key()).c_str(), cfg.signature_agent.c_str());
+    }
     if (cfg.mode == Mode::Real) {
         // Started here (the engine's later call is a no-op) so the header can
         // say what the ClientHello really offers: Schannel enables
@@ -161,6 +192,7 @@ int main(int argc, char** argv) {
         info.pq_requested = cfg.post_quantum;
         info.pq_offered = wc::tls::post_quantum_available();
     }
+    info.bot_auth = cfg.bot_auth_key.valid();
     std::fputs(format_summary(totals, info).c_str(), stdout);
     if (!cfg.record_path.empty()) {
         std::printf("Records: %llu sites written to %s\n", static_cast<unsigned long long>(engine.records_written()),

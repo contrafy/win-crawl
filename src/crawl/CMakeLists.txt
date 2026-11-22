@@ -16,7 +16,7 @@ add_library(wc_crawl STATIC
   record.cpp
   stats.cpp
   ${CMAKE_CURRENT_BINARY_DIR}/cloudflare_data.cpp)
-target_link_libraries(wc_crawl PUBLIC wc_options wc_net wc_parse wc_dns wc_tls)
+target_link_libraries(wc_crawl PUBLIC wc_options wc_net wc_parse wc_dns wc_tls wc_sig)
 
 wc_add_test(crawl_tests
   SOURCES

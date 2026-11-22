@@ -143,7 +143,8 @@ std::string format_json(const Snapshot& s, const RunInfo& info) {
     }
     appendf(out, ",\"peak_inflight\":%llu", static_cast<unsigned long long>(info.peak_inflight));
     const auto opt = [](const std::optional<bool>& v) { return !v ? "null" : *v ? "true" : "false"; };
-    appendf(out, ",\"pq_requested\":%s,\"pq_offered\":%s}\n", opt(info.pq_requested), opt(info.pq_offered));
+    appendf(out, ",\"pq_requested\":%s,\"pq_offered\":%s,\"bot_auth\":%s}\n", opt(info.pq_requested),
+            opt(info.pq_offered), info.bot_auth ? "true" : "false");
     return out;
 }
 

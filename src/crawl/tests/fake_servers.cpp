@@ -4,6 +4,7 @@
 
 #include <windows.h>
 
+#include <ctime>
 #include <future>
 
 namespace wc::crawl::test {
@@ -291,6 +292,9 @@ private:
             line = next + 2;
         }
         server_.count(host, path);
+        if (!server_.keys_.empty()) {
+            server_.check_signature(head);
+        }
 
         static const Route not_found{reply(404, "")};
         const Route* route = server_.find(host, path);
@@ -405,6 +409,32 @@ void FakeHttp::route(const std::string& host, const std::string& path, Route r) 
 const Route* FakeHttp::find(const std::string& host, const std::string& path) const {
     const auto it = routes_.find(host + " " + path);
     return it == routes_.end() ? nullptr : &it->second;
+}
+
+void FakeHttp::check_signature(const std::string& head) {
+    sig::Message msg;
+    std::string_view body;
+    sig::VerifyPolicy policy;
+    policy.now = static_cast<int64_t>(std::time(nullptr));
+    std::vector<sig::SignatureResult> results;
+    const sig::SigError e = sig::parse_http_message(head, msg, body)
+                                ? sig::verify_signatures(msg, keys_, policy, results)
+                                : sig::SigError::Malformed;
+    if (e == sig::SigError::None) {
+        ++sig_valid_;
+        return;
+    }
+    ++sig_invalid_;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (sig_error_.empty()) {
+        sig_error_ = std::string(sig::to_string(e)) + (results.empty() ? "" : ": " + results[0].detail) + " in " +
+                     head.substr(0, head.find('\r'));
+    }
+}
+
+std::string FakeHttp::first_signature_error() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return sig_error_;
 }
 
 void FakeHttp::count(const std::string& host, const std::string& path) {

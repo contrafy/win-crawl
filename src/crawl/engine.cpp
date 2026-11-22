@@ -10,6 +10,7 @@
 #include "parse/links.h"
 #include "parse/robots.h"
 #include "parse/url.h"
+#include "sig/signer.h"
 #include "tls/tls.h"
 
 #include <algorithm>
@@ -132,6 +133,9 @@ public:
     void task_done(Task* task);
     bool new_host(std::string_view host) { return engine_.hosts_.insert(host); }
     void emit(const SiteRecord& record);
+    // Web Bot Auth header lines for a request to `url`; empty unless
+    // --bot-auth-key. Valid until the next call on this loop.
+    std::string_view sign(const parse::Url& url);
 
     // Politeness bookkeeping. A parked task waits on politeness without a
     // socket; up to `slots` of them do not count against the loop's slots,
@@ -181,6 +185,8 @@ private:
     std::string records_;  // serialized records not yet handed to the writer
     uint64_t record_count_ = 0;
     SiteRecord scratch_;   // records of queued sites cancelled by a stop
+    sig::RequestSigner signer_;  // this loop's, so signing takes no lock
+    std::string authority_;      // reused @authority buffer
 };
 
 // One URL through the pipeline. Classic and real mode share the skeleton:
@@ -1115,6 +1121,7 @@ void Task::abort() {
 
 void Task::build_request(std::string_view method, const parse::Url& url) {
     request_.clear();
+    const std::string_view signature = w_.sign(url);
     if (!real() && !w_.cfg_.keepalive) {
         // --no-keepalive in classic mode reproduces the original crawler's
         // HTTP/1.0 requests (one request per connection).
@@ -1125,10 +1132,12 @@ void Task::build_request(std::string_view method, const parse::Url& url) {
         parse::append_host_header(request_, url);
         request_.append("\r\nUser-Agent: ");
         request_.append(kUserAgent);
-        request_.append("\r\nConnection: close\r\n\r\n");
+        request_.append("\r\nConnection: close\r\n");
+        request_.append(signature);
+        request_.append("\r\n");
         return;
     }
-    parse::append_request(request_, method, url, kUserAgent, w_.cfg_.keepalive);
+    parse::append_request(request_, method, url, kUserAgent, w_.cfg_.keepalive, signature);
 }
 
 Endpoint Task::endpoint(const parse::Url& url, uint32_t ipv4_be) const {
@@ -1174,6 +1183,20 @@ Worker::Worker(Engine& engine, size_t index, unsigned slots, unsigned dns_inflig
         free_.push_back(tasks_[i - 1].get());
     }
     batch_.reserve(kClaimBatch);
+    if (cfg_.bot_auth_key.valid()) {
+        sig::SignerOptions options;
+        options.signature_agent = cfg_.signature_agent;
+        signer_.init(cfg_.bot_auth_key, options);  // parse_args validated the URL
+    }
+}
+
+std::string_view Worker::sign(const parse::Url& url) {
+    if (!signer_.ready()) {
+        return {};
+    }
+    authority_.clear();
+    parse::append_host_header(authority_, url);  // the Host value: RFC 9421 @authority
+    return signer_.sign(authority_);
 }
 
 Worker::~Worker() = default;

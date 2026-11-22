@@ -41,6 +41,10 @@ struct SignerOptions {
     std::string tag = "web-bot-auth";
 };
 
+// What init() accepts as a Signature-Agent URL: "https://" plus at least one
+// more character, printable ASCII only.
+bool valid_signature_agent(std::string_view url);
+
 class RequestSigner {
 public:
     // False, with a reason in `error`, for a bad label, member key, tag,
